@@ -57,6 +57,7 @@ coverage.xml
 .vscode/
 
 # Data, models, outputs
+
 models/
 output/
 data/
