@@ -1,13 +1,117 @@
-# HUMINT Source Performance: ML-TSSP Model
 
-A hybrid Machine Learning - Two-Stage Stochastic Programming (ML-TSSP) system for evaluating and optimizing HUMINT (Human Intelligence) source performance and task assignments.
+# HUMINT Source Performance: ML-TSSP Framework
 
-## Overview
+**HUMINT ML-TSSP** is a production-grade, modular system for evaluating, optimizing, and visualizing Human Intelligence (HUMINT) source performance and task assignments. It combines advanced machine learning (ML) with a two-stage stochastic programming (TSSP) optimization model, all accessible via an interactive Streamlit dashboard.
 
-This project combines:
-- **Machine Learning Models**: Classification (behavior prediction) and Regression (reliability/deception scores)
-- **Two-Stage Stochastic Optimization**: Strategic tasking decisions with recourse for uncertain behaviors
-- **Cost Analysis**: Comprehensive cost decomposition and attribution analysis
+## What Does the ML-TSSP Dashboard Deliver?
+
+- **End-to-end pipeline**: From raw/simulated HUMINT data to actionable, risk-aware task assignments.
+- **ML-driven risk assessment**: Predicts source behavior (cooperative, uncertain, coerced, deceptive), reliability, and deception using XGBoost and GRU models.
+- **TSSP optimization**: Assigns sources to tasks, balancing operational cost and risk under uncertainty, with recourse for adverse behaviors.
+- **Interactive dashboard**: Visualizes assignments, risk buckets, cost breakdowns, and allows scenario analysis with custom recourse policies.
+- **Formula fallback**: System remains fully functional even if ML models are missing, using robust formula-based risk and behavior estimation.
+
+## Core Model Pipeline
+
+1. **Data Ingestion & Feature Engineering**
+  - Accepts CSV uploads or generates synthetic HUMINT datasets (15,000+ sources typical).
+  - Features: task success rate, corroboration, timeliness, handler confidence, deception, CI flags, etc.
+
+2. **Machine Learning Models**
+  - **Behavior Classification**: XGBoost classifier predicts probabilities for each behavior class.
+  - **Reliability & Deception Regression**: GRU (deep learning) regressors output continuous reliability and deception scores (0-1).
+  - **Label encoding & scaling**: Ensures robust, production-ready inference.
+
+3. **Two-Stage Stochastic Optimization (TSSP)**
+  - **Stage 1**: Assign sources to tasks to minimize expected cost, subject to operational constraints.
+  - **Stage 2 (Recourse)**: Adjusts for realized behaviors (e.g., disengage, flag, escalate) to minimize risk/cost after uncertainty is revealed.
+  - **Risk buckets**: Each source is categorized as low, medium, or high risk based on ML-predicted probabilities and recourse policy.
+
+4. **Cost & Risk Analysis**
+  - Decomposes total cost by behavior class, source, and recourse action.
+  - Computes expected loss (EMV), risk-adjusted assignment scores, and visualizes cost/risk tradeoffs.
+
+5. **Interactive Dashboard (Streamlit)**
+  - Upload data, tune recourse policies, and run scenario analysis in real time.
+  - Visualizes assignments, risk buckets, KPIs, cost breakdowns, and model explanations (SHAP-style).
+  - Fully functional fallback mode if ML models are missing (formula-based risk/behavior estimation).
+
+## Key Features
+
+- **Production-ready**: Modular, robust, and cloud-deployable (Streamlit Cloud, GitHub Actions).
+- **Explainable**: SHAP-style feature attributions for model predictions.
+- **Customizable**: Recourse policies, risk thresholds, and solver options are user-tunable.
+- **Failsafe**: Formula-based fallback ensures dashboard and optimization always work, even if models are missing.
+- **Comprehensive outputs**: Assignment tables, risk/cost plots, downloadable reports, and more.
+
+## Example ML-TSSP Flow
+
+1. **Upload or generate HUMINT data**
+2. **ML models predict**: behavior probabilities, reliability, deception
+3. **TSSP optimizer assigns**: sources to tasks, minimizing expected loss
+4. **Recourse actions**: disengage, flag, escalate, or assign based on risk
+5. **Dashboard visualizes**: assignments, risk buckets, cost breakdowns, and allows scenario tuning
+
+## Model Details
+
+- **Behavior Classes**: Cooperative, Uncertain, Coerced, Deceptive
+- **ML Models**:
+  - XGBoost classifier for behavior prediction
+  - GRU regressors for reliability and deception (with scaler support)
+- **Optimization**:
+  - Pyomo-based TSSP model
+  - Stage 1: Assignment, Stage 2: Recourse (risk mitigation)
+  - Risk buckets: Low (<0.3), Medium (0.3-0.6), High (>0.6)
+- **Recourse Actions**: Disengage, flag for CI, escalate, assign
+- **Fallback**: Formula-based risk/behavior estimation if models are missing
+
+## Dashboard Highlights
+
+- **KPI indicators**: Assignment quality, risk, and cost
+- **Assignment tables**: Per-source actions, risk, and task
+- **Risk/cost plots**: By behavior, source, and recourse action
+- **Scenario analysis**: Tune recourse thresholds and instantly see impact
+- **Health checks**: System status, model availability, and fallback mode
+
+## How to Run
+
+1. **Locally**:
+  ```bash
+  pip install -r requirements.txt
+  streamlit run streamlit_app.py
+  ```
+2. **Streamlit Cloud**:
+  - Connect this repo, set main file to `streamlit_app.py`
+3. **Command-line pipeline**:
+  ```bash
+  python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
+  ```
+
+## Outputs
+
+- `models/`: Trained ML models (`classification_model.pkl`, `reliability_model.keras`, `deception_model.keras`, scalers)
+- `output/`: Cost/risk plots, assignment tables, reports
+
+## References
+
+- See `dashboard.py` for full dashboard logic and fallback details
+- See `src/pipeline.py` for ML-TSSP pipeline implementation
+
+## License
+
+[Specify your license here]
+
+## Citation
+
+If you use this code, please cite:
+```
+HUMINT Source Performance: ML-TSSP Model
+Hybrid Machine Learning - Two-Stage Stochastic Programming Approach
+```
+
+## Contact
+
+[Your contact information]
 
 ## Project Structure
 
