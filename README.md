@@ -99,7 +99,10 @@
 
 ## License
 
-[Specify your license here]
+
+## License
+
+This project is licensed under the MIT License. See the LICENSE file for details.
 
 ## Citation
 
@@ -111,7 +114,10 @@ Hybrid Machine Learning - Two-Stage Stochastic Programming Approach
 
 ## Contact
 
-[Your contact information]
+**Lucas Wafula**  
+Graduate Student, MSc. Data Science & Analytics  
+Strathmore Institute of Mathematical Sciences  
+Email: lucas.wafula@strathmore.edu
 
 ## Project Structure
 
