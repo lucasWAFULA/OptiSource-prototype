@@ -11,7 +11,6 @@ import numpy as np
 import pandas as pd
 import joblib
 
-from src.pipeline import MLTSSPPipeline
 from src.utils.config import MODELS_DIR, PROJECT_ROOT
 from src.ml import ClassificationModelTrainer, RegressionModelTrainer
 
