@@ -11,7 +11,7 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import generate_humint_dataset
+from src.data.data_generation import generate_humint_dataset
 
 
 def test_data_generation():
