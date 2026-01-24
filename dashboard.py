@@ -110,6 +110,8 @@ try:
 except ImportError as e:
     MODULAR_PIPELINE_AVAILABLE = False
     _dashboard_pipeline = None
+    import streamlit as st
+    st.error(f"Pipeline import failed: {e}")
 
 # Initialize ML pipeline (cached for Streamlit)
 if MODE == "streamlit":
