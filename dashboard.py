@@ -17,7 +17,7 @@ import base64
 import streamlit as st
 # --- Ensure src/ is in the Python path for imports (for Streamlit Cloud compatibility) ---
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent / "src"))
+sys.path.insert(0, str(Path(__file__).parent))
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 os.environ['OMP_NUM_THREADS'] = '1'  # Limit CPU threads
 os.environ['MKL_NUM_THREADS'] = '1'  # Limit MKL threads
