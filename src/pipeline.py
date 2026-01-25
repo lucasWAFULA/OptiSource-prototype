@@ -19,12 +19,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.data_generation import generate_humint_dataset
-from src.data.preprocessing import prepare_classification_data, prepare_regression_data
-from src.ml import ClassificationModelTrainer, RegressionModelTrainer
-from src.optimization import TSSPModel
-from src.analysis import analyze_costs, generate_cost_report
-from src.utils.config import (
+
+from .data.data_generation import generate_humint_dataset
+from .data.preprocessing import prepare_classification_data, prepare_regression_data
+from .ml import ClassificationModelTrainer, RegressionModelTrainer
+from .optimization import TSSPModel
+from .analysis import analyze_costs, generate_cost_report
+from .utils.config import (
     PROJECT_ROOT, MODELS_DIR, OUTPUT_DIR, BEHAVIOR_CLASSES, RECOURSE_COSTS,
     CLASSIFICATION_FEATURES_FILE, REGRESSION_FEATURES_FILE
 )
