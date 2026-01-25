@@ -111,7 +111,8 @@ except ImportError as e:
     MODULAR_PIPELINE_AVAILABLE = False
     _dashboard_pipeline = None
     import streamlit as st
-    st.error(f"Pipeline import failed: {e}")
+    import traceback
+    st.error(f"Pipeline import failed: {e}\nTraceback:\n{traceback.format_exc()}")
 
 # Initialize ML pipeline (cached for Streamlit)
 if MODE == "streamlit":
