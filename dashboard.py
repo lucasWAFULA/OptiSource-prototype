@@ -887,23 +887,10 @@ def run_optimization(payload: dict):
     models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
     
     # Try to use actual TSSP pipeline if models are available
+    # NOTE: Avoid importing src.pipeline here; it depends on src.data (not shipped for cloud deploys).
+    # The dashboard relies on _ml_pipeline + API/fallback paths for runtime execution.
     if models_available:
-        try:
-            # Use actual pipeline optimization
-            from src.pipeline import MLTSSPPipeline
-            pipeline = MLTSSPPipeline()
-            
-            # Prepare sources for pipeline
-            sources = payload.get("sources", [])
-            if sources:
-                # Convert dashboard format to pipeline format
-                # This would require source data preparation
-                # For now, fall back to _fallback_optimization
-                pass
-        except Exception as e:
-            if MODE == "streamlit":
-                st.warning(f"Pipeline optimization unavailable: {e}. Using formula-based fallback.")
-            models_available = False
+        pass
     
     # Use local API or fallback
     if USE_LOCAL_API:
