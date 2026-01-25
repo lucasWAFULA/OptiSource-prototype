@@ -8,3 +8,6 @@ plotly
 joblib
 imbalanced-learn
 h5py
+shap
+fastapi
+uvicorn
