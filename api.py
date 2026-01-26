@@ -55,74 +55,67 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         and ml_pipeline.models_loaded
     )
     
-    # Track if ML models were successfully used (for at least one source)
-    ml_models_used = False
+    # ML-TSSP REQUIRED: System uses ML models (XGBoost + GRU) - no formula fallback
+    if not use_ml_models:
+        raise RuntimeError(
+            "ML-TSSP models are required for optimization. "
+            "ML pipeline is not available or models are not loaded. "
+            "Please ensure ML models are properly initialized before running optimization."
+        )
     
-    for source in sources:
-        features = source.get("features", {})
-        tsr = features.get("task_success_rate", 0.5)
-        cor = features.get("corroboration_score", 0.5)
-        time = features.get("report_timeliness", 0.5)
-        handler = features.get("handler_confidence", 0.5)
-        dec_score = features.get("deception_score", 0.3)
-        ci = features.get("ci_flag", 0)
+    # PERFORMANCE OPTIMIZATION: Use batch predictions instead of per-source predictions
+    # This is 10-100x faster for large source sets
+    try:
+        # Prepare features dicts for all sources
+        features_dicts = []
+        for source in sources:
+            features = source.get("features", {})
+            features_dict = {
+                "tsr": features.get("task_success_rate", 0.5),
+                "cor": features.get("corroboration_score", 0.5),
+                "time": features.get("report_timeliness", 0.5),
+                "handler": features.get("handler_confidence", 0.5),
+                "dec_score": features.get("deception_score", 0.3),
+                "ci": features.get("ci_flag", 0)
+            }
+            features_dicts.append(features_dict)
         
-        # Prepare features dict for ML pipeline
-        features_dict = {
-            "tsr": tsr,
-            "cor": cor,
-            "time": time,
-            "handler": handler,
-            "dec_score": dec_score,
-            "ci": ci
-        }
+        # Batch predictions (much faster than per-source)
+        if hasattr(ml_pipeline, 'predict_batch_reliability_scores'):
+            # Use batch prediction methods if available
+            reliability_scores = ml_pipeline.predict_batch_reliability_scores(features_dicts)
+            deception_scores = ml_pipeline.predict_batch_deception_scores(features_dicts)
+            behavior_probs_list = ml_pipeline.predict_batch_behavior_probabilities(features_dicts)
+        else:
+            # Fallback to per-source predictions (slower but works)
+            reliability_scores = []
+            deception_scores = []
+            behavior_probs_list = []
+            for features_dict in features_dicts:
+                reliability_scores.append(ml_pipeline.predict_reliability_score(features_dict))
+                deception_scores.append(ml_pipeline.predict_deception_score(features_dict))
+                behavior_probs_list.append(ml_pipeline.predict_behavior_probabilities(features_dict))
+            reliability_scores = np.array(reliability_scores)
+            deception_scores = np.array(deception_scores)
         
-        # PRIMARY METHOD: Use ML-TSSP models (XGBoost + GRU) for all predictions
-        reliability = None
-        deception = None
-        behavior_probs_ml = None
-        ml_prediction_failed = False
+        ml_models_used = True
         
-        if use_ml_models:
-            try:
-                # PRIMARY: Use GRU Regressor for reliability score (ML-TSSP)
-                reliability = ml_pipeline.predict_reliability_score(features_dict)
-                
-                # PRIMARY: Use GRU Regressor for deception score (ML-TSSP)
-                deception = ml_pipeline.predict_deception_score(features_dict)
-                
-                # PRIMARY: Use XGBoost Classifier for behavior probabilities (ML-TSSP)
-                behavior_probs_lower = ml_pipeline.predict_behavior_probabilities(features_dict)
-                
-                # Convert to lowercase keys format expected by this function
-                behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
-                
-                # Mark that ML models were successfully used (PRIMARY METHOD)
-                ml_models_used = True
-                
-            except Exception:
-                # ML prediction failed - will fall back to formulas (NOT RECOMMENDED)
-                ml_prediction_failed = True
-                reliability = None
-                deception = None
-                behavior_probs_ml = None
+    except Exception as e:
+        # ML prediction failed - raise error instead of falling back
+        raise RuntimeError(
+            f"ML-TSSP batch prediction failed: {str(e)}. "
+            "The system requires ML models to operate. Please check model files and pipeline configuration."
+        ) from e
+    
+    # Process each source with pre-computed predictions
+    for idx, source in enumerate(sources):
+        # Get pre-computed predictions
+        reliability = float(reliability_scores[idx])
+        deception = float(deception_scores[idx])
+        behavior_probs_lower = behavior_probs_list[idx]
         
-        # FALLBACK ONLY: Use formula-based calculations ONLY if ML not available or failed
-        # This is a safety fallback, not the primary method
-        if reliability is None or deception is None:
-            # Formula-based reliability calculation (fallback)
-            reliability = np.clip(
-                0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler
-                - 0.15 * dec_score - 0.10 * ci + 0.05 * rng.normal(0, 0.03),
-                0.0, 1.0
-            )
-            
-            # Formula-based deception calculation (fallback)
-            deception = np.clip(
-                0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler)
-                + 0.10 * rng.beta(2, 5),
-                0.0, 1.0
-            )
+        # Convert to lowercase keys format expected by this function
+        behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
         
         # Get recourse rules
         recourse = source.get("recourse_rules", {})
@@ -145,32 +138,13 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             action = "task"
             task = rng.choice(TASK_ROSTER)
         
-        # PRIMARY: Use ML behavior probabilities (XGBoost), FALLBACK: formulas only if ML unavailable
-        if behavior_probs_ml is not None:
-            # PRIMARY METHOD: Use ML-predicted behavior probabilities (from XGBoost Classifier)
-            behavior_probs = behavior_probs_ml
-        else:
-            # FALLBACK ONLY: Formula-based behavior probabilities (used only when ML unavailable)
-            cooperative_prob = max(0.0, min(1.0, reliability * (1 - deception) * 1.2))
-            uncertain_prob = max(0.0, min(1.0, (1 - reliability) * 0.4))
-            coerced_prob = max(0.0, min(1.0, deception * 0.3))
-            deceptive_prob = max(0.0, min(1.0, deception * 0.5))
-
-            total = cooperative_prob + uncertain_prob + coerced_prob + deceptive_prob
-            if total > 0:
-                behavior_probs = {
-                    "cooperative": cooperative_prob / total,
-                    "uncertain": uncertain_prob / total,
-                    "coerced": coerced_prob / total,
-                    "deceptive": deceptive_prob / total
-                }
-            else:
-                behavior_probs = {
-                    "cooperative": 0.25,
-                    "uncertain": 0.25,
-                    "coerced": 0.25,
-                    "deceptive": 0.25
-                }
+        # ML-TSSP REQUIRED: Use ML-predicted behavior probabilities (from XGBoost Classifier)
+        if behavior_probs_ml is None:
+            raise RuntimeError(
+                f"ML-TSSP behavior probability prediction failed for source {source.get('source_id', 'UNKNOWN')}. "
+                "The system requires ML models to operate."
+            )
+        behavior_probs = behavior_probs_ml
 
         # Calculate intrinsic risk (before recourse/action adjustment)
         intrinsic_risk = sum(
