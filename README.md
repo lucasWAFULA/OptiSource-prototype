@@ -1,21 +1,23 @@
 
 # HUMINT Source Performance: ML-TSSP Framework
 
-**HUMINT ML-TSSP** is a production-grade, modular system for evaluating, optimizing, and visualizing Human Intelligence (HUMINT) source performance and task assignments. It combines advanced machine learning (ML) with a two-stage stochastic programming (TSSP) optimization model, all accessible via an interactive Streamlit dashboard.
+**HUMINT ML-TSSP** is a robust, modular platform for evaluating, optimizing, and visualizing Human Intelligence (HUMINT) source performance and task assignments. Leveraging advanced machine learning and a two-stage stochastic programming (TSSP) optimization model, the system provides actionable insights through an interactive Streamlit dashboard. Designed for reliability, explainability, and operational flexibility, it supports both production and research use cases.
 
-## What Does the ML-TSSP Dashboard Deliver?
 
-- **End-to-end pipeline**: From raw/simulated HUMINT data to actionable, risk-aware task assignments.
+## Key Features
+
+- **End-to-end pipeline**: Transforms raw or simulated HUMINT data into risk-aware, optimized task assignments.
 - **ML-driven risk assessment**: Predicts source behavior (cooperative, uncertain, coerced, deceptive), reliability, and deception using XGBoost and GRU models.
 - **TSSP optimization**: Assigns sources to tasks, balancing operational cost and risk under uncertainty, with recourse for adverse behaviors.
-- **Interactive dashboard**: Visualizes assignments, risk buckets, cost breakdowns, and allows scenario analysis with custom recourse policies.
-- **Formula fallback**: System remains fully functional even if ML models are missing, using robust formula-based risk and behavior estimation.
+- **Interactive dashboard**: Visualizes assignments, risk buckets, cost breakdowns, and supports scenario analysis with custom recourse policies.
+- **Failsafe fallback**: Remains fully functional using formula-based risk and behavior estimation if ML models are unavailable.
 
-## Core Model Pipeline
+
+## Core Pipeline Overview
 
 1. **Data Ingestion & Feature Engineering**
   - Accepts CSV uploads or generates synthetic HUMINT datasets (15,000+ sources typical).
-  - Features: task success rate, corroboration, timeliness, handler confidence, deception, CI flags, etc.
+  - Features include: task success rate, corroboration, timeliness, handler confidence, deception, CI flags, and more.
 
 2. **Machine Learning Models**
   - **Behavior Classification**: XGBoost classifier predicts probabilities for each behavior class.
@@ -36,7 +38,8 @@
   - Visualizes assignments, risk buckets, KPIs, cost breakdowns, and model explanations (SHAP-style).
   - Fully functional fallback mode if ML models are missing (formula-based risk/behavior estimation).
 
-## Key Features
+
+## Additional Highlights
 
 - **Production-ready**: Modular, robust, and cloud-deployable (Streamlit Cloud, GitHub Actions).
 - **Explainable**: SHAP-style feature attributions for model predictions.
@@ -44,13 +47,15 @@
 - **Failsafe**: Formula-based fallback ensures dashboard and optimization always work, even if models are missing.
 - **Comprehensive outputs**: Assignment tables, risk/cost plots, downloadable reports, and more.
 
-## Example ML-TSSP Flow
+
+## Example Workflow
 
 1. **Upload or generate HUMINT data**
 2. **ML models predict**: behavior probabilities, reliability, deception
 3. **TSSP optimizer assigns**: sources to tasks, minimizing expected loss
 4. **Recourse actions**: disengage, flag, escalate, or assign based on risk
 5. **Dashboard visualizes**: assignments, risk buckets, cost breakdowns, and allows scenario tuning
+
 
 ## Model Details
 
@@ -65,6 +70,7 @@
 - **Recourse Actions**: Disengage, flag for CI, escalate, assign
 - **Fallback**: Formula-based risk/behavior estimation if models are missing
 
+
 ## Dashboard Highlights
 
 - **KPI indicators**: Assignment quality, risk, and cost
@@ -73,46 +79,50 @@
 - **Scenario analysis**: Tune recourse thresholds and instantly see impact
 - **Health checks**: System status, model availability, and fallback mode
 
-## How to Run
 
-1. **Locally**:
+## Getting Started
+
+1. **Local Deployment**:
   ```bash
   pip install -r requirements.txt
   streamlit run streamlit_app.py
   ```
 2. **Streamlit Cloud**:
-  - Connect this repo, set main file to `streamlit_app.py`
-3. **Command-line pipeline**:
+  - Connect this repository and set the main file to `streamlit_app.py`.
+3. **Command-line Pipeline**:
   ```bash
   python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
   ```
+
 
 ## Outputs
 
 - `models/`: Trained ML models (`classification_model.pkl`, `reliability_model.keras`, `deception_model.keras`, scalers)
 - `output/`: Cost/risk plots, assignment tables, reports
 
+
 ## References
 
 - See `dashboard.py` for full dashboard logic and fallback details
 - See `src/pipeline.py` for ML-TSSP pipeline implementation
-
-## License
 
 
 ## License
 
 This project is licensed under the MIT License. See the LICENSE file for details.
 
+
 ## Citation
 
 If you use this code, please cite:
-```
-HUMINT Source Performance: ML-TSSP Model
+
+HUMINT Source Performance: ML-TSSP Model  
 Hybrid Machine Learning - Two-Stage Stochastic Programming Approach
-```
+
 
 ## Contact
+
+For questions or collaboration, please contact:
 
 **Lucas Wafula**  
 Graduate Student, MSc. Data Science & Analytics  
