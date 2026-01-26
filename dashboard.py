@@ -27,7 +27,7 @@ try:
         get_pending_tasking_requests, get_pending_recommendations,
         get_user_tasking_requests, get_latest_assignments, get_audit_log, log_audit,
         save_optimization_results, load_latest_optimization_results, get_optimization_results_timestamp,
-        batch_save_sources, batch_save_assignments
+        batch_save_sources, batch_save_assignments, DB_ENGINE, DB_CONNECTED
     )
     SHARED_DB_AVAILABLE = True
 except ImportError:
@@ -480,8 +480,37 @@ def _sync_results_from_shared_db():
     """
     Sync optimization results from shared database to session state.
     This ensures all sections (Admin, Executive, etc.) see the same results.
+    
+    PERFORMANCE OPTIMIZATION: Uses caching to prevent redundant database queries.
+    Only syncs once per render cycle, not on every section render.
     """
+    # #region agent log
+    import json as _json_log
+    try:
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:ENTRY", "message": "Sync called", "data": {"shard_db_available": SHARED_DB_AVAILABLE, "has_existing_results": st.session_state.get("results") is not None, "existing_timestamp": st.session_state.get("shared_results_timestamp"), "sync_already_done": st.session_state.get("_sync_done_this_render", False)}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+    except: pass
+    # #endregion
+    
     if not SHARED_DB_AVAILABLE:
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:EXIT", "message": "Shared DB not available", "data": {}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except: pass
+        # #endregion
+        return False
+    
+    # PERFORMANCE: Only sync once per render cycle to avoid redundant DB queries
+    # Check if we've already synced this render cycle BEFORE making database calls
+    render_id = st.session_state.get("_current_render_id", 0)
+    if st.session_state.get("_sync_done_this_render") == render_id:
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:CACHED", "message": "Sync skipped (cached)", "data": {"render_id": render_id}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except: pass
+        # #endregion
         return False
     
     try:
@@ -489,9 +518,19 @@ def _sync_results_from_shared_db():
         existing_results = st.session_state.get("results")
         existing_timestamp = st.session_state.get("shared_results_timestamp")
         
-        # Get latest results from shared DB
+        # Get latest results from shared DB (only if not cached)
         shared_results, shared_sources = load_latest_optimization_results()
         shared_timestamp = get_optimization_results_timestamp()
+        
+        # Mark sync as done for this render cycle (even if no sync was needed) - BEFORE processing results
+        st.session_state["_sync_done_this_render"] = render_id
+        
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:CHECK", "message": "Sync check", "data": {"has_shared_results": shared_results is not None, "has_shared_sources": shared_sources is not None, "shared_timestamp": shared_timestamp, "existing_timestamp": existing_timestamp, "timestamps_match": existing_timestamp == shared_timestamp, "will_sync": existing_results is None or existing_timestamp != shared_timestamp}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A,B,C"}) + "\n")
+        except: pass
+        # #endregion
         
         if shared_results and shared_sources:
             # Check if shared results are newer than what we have
@@ -504,16 +543,51 @@ def _sync_results_from_shared_db():
                 st.session_state["results_changed"] = True
                 st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
                 st.session_state["results_stale"] = False
+                # #region agent log
+                try:
+                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                        _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:SUCCESS", "message": "Synced results", "data": {"n_sources": len(shared_sources) if shared_sources else 0, "has_policies": "policies" in shared_results, "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A,B,C"}) + "\n")
+                except: pass
+                # #endregion
                 return True
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:NO_SYNC", "message": "No sync needed", "data": {"reason": "no_shared_data" if not (shared_results and shared_sources) else "timestamps_match"}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A,B,C"}) + "\n")
+        except: pass
+        # #endregion
         return False
     except Exception as e:
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:ERROR", "message": "Sync error", "data": {"error": str(e)}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except: pass
+        # #endregion
         if MODE == "streamlit":
             st.warning(f"⚠️ Could not sync results from shared database: {e}")
         return False
 
 
-def _auto_refresh_results(sources):
+def _auto_refresh_results(sources, allow_real_data: bool = False):
     """Auto-refresh optimization results to reflect current parameters."""
+    # #region agent log
+    import json as _json_log
+    try:
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:ENTRY", "message": "Auto refresh called", "data": {"n_sources": len(sources) if sources else 0, "results_stale": st.session_state.get("results_stale"), "auto_refresh_in_progress": st.session_state.get("_auto_refresh_in_progress")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+    except: pass
+    # #endregion
+    # Guard: avoid auto-refresh in Real Data Mode unless explicitly allowed
+    data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
+    if data_mode == "📊 Real Data Mode (Your Input)" and not allow_real_data:
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:SKIP", "message": "Auto refresh skipped (real data mode)", "data": {"data_mode": data_mode, "allow_real_data": allow_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+        except: pass
+        # #endregion
+        return
     if st.session_state.get("_auto_refresh_in_progress"):
         return
     st.session_state["_auto_refresh_in_progress"] = True
@@ -547,6 +621,12 @@ def _auto_refresh_results(sources):
                 if MODE == "streamlit":
                     st.warning(f"⚠️ Could not save results to shared database: {e}")
     st.session_state["_auto_refresh_in_progress"] = False
+    # #region agent log
+    try:
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:EXIT", "message": "Auto refresh complete", "data": {"results_stale": st.session_state.get("results_stale"), "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+    except: pass
+    # #endregion
 
 def _apply_preset_mode():
     """Apply preset mode defaults to sliders and mark results stale."""
@@ -1463,6 +1543,9 @@ def _check_system_health():
     health['details']['pyomo_available'] = PYOMO_AVAILABLE
     health['details']['cvxpy_available'] = CVXPY_AVAILABLE
     health['details']['shap_available'] = SHAP_AVAILABLE
+    health['details']['shared_db_engine'] = DB_ENGINE
+    health['details']['shared_db_connected'] = DB_CONNECTED
+    health['details']['shared_db_mode'] = "Cloud (Postgres)" if DB_ENGINE == "postgres" else "Local (SQLite)"
     
     return health
 
@@ -1620,6 +1703,13 @@ def _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, tot
 
 def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reduction):
     # Always sync results from shared DB at section start
+    # #region agent log
+    import json as _json_log
+    try:
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_render_strategic_decision_section:ENTRY", "message": "Section render start", "data": {"section": "strategic_decision", "has_sources": sources is not None, "has_ml_policy": ml_policy is not None}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
+    except: pass
+    # #endregion
     _sync_results_from_shared_db()
     st.markdown("""
     <div class="insight-box">
@@ -6386,6 +6476,9 @@ def render_streamlit_app():
     """Main Streamlit application with left-side controls."""
     _init_streamlit()
     
+    # PERFORMANCE: Increment render ID to reset sync cache for new render cycle
+    st.session_state["_current_render_id"] = st.session_state.get("_current_render_id", 0) + 1
+    
     # ======================================================
     # STARTUP STATUS BANNER
     # ======================================================
@@ -6438,6 +6531,18 @@ def render_streamlit_app():
             
             with st.expander("📋 Detailed Status"):
                 st.json(health_status['details'])
+
+            # Shared DB status badge
+            db_mode = health_status.get("details", {}).get("shared_db_mode", "Unknown")
+            db_connected = health_status.get("details", {}).get("shared_db_connected", False)
+            db_badge_color = "#10b981" if db_connected else "#f59e0b"
+            st.markdown(
+                f"<div style='margin-top:0.4rem;font-size:11px;color:#334155;'>"
+                f"<span style='padding:2px 6px;border-radius:6px;background:{db_badge_color};color:white;font-weight:700;'>"
+                f"{'DB Connected' if db_connected else 'DB Not Connected'}</span> "
+                f"<span style='margin-left:6px;'>Mode: {db_mode}</span></div>",
+                unsafe_allow_html=True
+            )
         
         # Clear startup message
         startup_placeholder.empty()
@@ -6446,6 +6551,13 @@ def render_streamlit_app():
         # SYNC WITH SHARED DATABASE (Multi-User Interconnection)
         # ======================================================
         if SHARED_DB_AVAILABLE:
+            # #region agent log
+            import json as _json_log
+            try:
+                with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(_json_log.dumps({"location": "dashboard.py:render_streamlit_app:STARTUP_SYNC", "message": "Startup sync", "data": {"has_existing_results": st.session_state.get("results") is not None}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "E"}) + "\n")
+            except: pass
+            # #endregion
             # Sync FULL optimization results from shared database (on every load)
             # This ensures all sections (Admin, Executive, etc.) see the same results
             _sync_results_from_shared_db()
@@ -8102,6 +8214,13 @@ def render_streamlit_app():
         if st.session_state.get("results") and last_rules_hash is not None and rules_hash != last_rules_hash:
             st.session_state["results_stale"] = True
             st.warning("⚠️ Decision thresholds have changed. Results may be outdated. Re-run optimization to update.")
+            # #region agent log
+            try:
+                import json as _json_log
+                with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(_json_log.dumps({"location": "dashboard.py:recourse_rules_set:STALE", "message": "Results marked stale", "data": {"rules_hash": rules_hash, "last_rules_hash": last_rules_hash}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2"}) + "\n")
+            except: pass
+            # #endregion
         # #region agent log
         _debug_log("dashboard.py:recourse_rules_set", "sidebar thresholds done; recourse_rules updated from sliders", {"rel_disengage": rel_disengage, "rel_ci_flag": rel_ci_flag, "dec_disengage": dec_disengage, "dec_ci_flag": dec_ci_flag}, "H2,H3,H4")
         # #endregion
@@ -8236,6 +8355,13 @@ def render_streamlit_app():
     if use_real_data:
         if custom_count + batch_count == 0:
             use_real_data = False
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:data_mode", "message": "Data mode computed", "data": {"data_mode": data_mode, "custom_count": custom_count, "batch_count": batch_count, "pending_count": pending_count, "use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H1"}) + "\n")
+    except: pass
+    # #endregion
     
     if use_real_data:
         # REAL DATA MODE: use custom + processed batch only (pending = not yet processed)
@@ -8393,18 +8519,46 @@ def render_streamlit_app():
             else:
                 results = st.session_state.get("results")
                 if st.session_state.get("results_stale"):
+                    # #region agent log
+                    try:
+                        import json as _json_log
+                        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                            _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:exec_summary", "message": "Results stale branch", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+                    except: pass
+                    # #endregion
                     if use_real_data:
                         st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
                         if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
                             if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_exec", use_container_width=True):
-                                _auto_refresh_results(sources)
+                                _auto_refresh_results(sources, allow_real_data=True)
+                                # #region agent log
+                                try:
+                                    import json as _json_log
+                                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:exec_summary", "message": "Rerun triggered (exec summary)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                                except: pass
+                                # #endregion
                                 st.rerun()
                     else:
                         _auto_refresh_results(sources)
+                        # #region agent log
+                        try:
+                            import json as _json_log
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:exec_summary_auto", "message": "Auto rerun (exec summary)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                        except: pass
+                        # #endregion
                         st.rerun()
                 if len(sources) == 0:
                     st.session_state["results"] = None
                     st.info("No sources available. Add demo sources or upload real data to run optimization.")
+                    # #region agent log
+                    try:
+                        import json as _json_log
+                        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                            _f.write(_json_log.dumps({"location": "dashboard.py:rerun:no_sources_exec", "message": "Rerun due to no sources", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H3"}) + "\n")
+                    except: pass
+                    # #endregion
                     st.rerun()
                 ml_emv = results.get("emv", {}).get("ml_tssp", 0)
                 uni_emv = results.get("emv", {}).get("uniform", 0)
@@ -8700,9 +8854,22 @@ def render_streamlit_app():
                 # Database saves happen in background (non-blocking) - don't wait for these
                 if SHARED_DB_AVAILABLE:
                     try:
+                        # #region agent log
+                        import json as _json_log
+                        try:
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_START", "message": "Starting DB save", "data": {"n_sources": len(sources) if sources else 0, "has_result": result is not None, "username": username}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+                        except: pass
+                        # #endregion
                         # Save full optimization results (policies, EMV, etc.)
                         save_optimization_results(result, sources, username)
                         st.session_state["shared_results_timestamp"] = get_optimization_results_timestamp()
+                        # #region agent log
+                        try:
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_COMPLETE", "message": "DB save complete", "data": {"timestamp": st.session_state.get("shared_results_timestamp")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
+                        except: pass
+                        # #endregion
                         
                         # PERFORMANCE: Batch save sources and assignments (much faster than one-by-one)
                         ml_policy = result.get("policies", {}).get("ml_tssp", [])
@@ -8737,7 +8904,20 @@ def render_streamlit_app():
                         # Don't fail optimization if database save fails - log silently
                         if MODE == "streamlit":
                             pass  # Database save failures don't block user experience
-                
+                        # #region agent log
+                        try:
+                            import json as _json_log
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_ERROR", "message": "DB save error", "data": {"error": str(e)}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "F"}) + "\n")
+                        except: pass
+                        # #endregion
+
+                # #region agent log
+                try:
+                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                        _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:RERUN", "message": "Triggering rerun", "data": {"has_results": st.session_state.get("results") is not None, "shared_timestamp": st.session_state.get("shared_results_timestamp"), "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D,E"}) + "\n")
+                except: pass
+                # #endregion
                 st.rerun()
             except RuntimeError as e:
                 # ML models required error
@@ -8966,14 +9146,35 @@ def render_streamlit_app():
     if nav_key == "policies" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
         if st.session_state.get("results_stale"):
+            # #region agent log
+            try:
+                import json as _json_log
+                with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:policies", "message": "Results stale branch (policies)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+            except: pass
+            # #endregion
             if use_real_data:
                 st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
                 if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
                     if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_policies", use_container_width=True):
-                        _auto_refresh_results(st.session_state.get("sources") or [])
+                        _auto_refresh_results(st.session_state.get("sources") or [], allow_real_data=True)
+                        # #region agent log
+                        try:
+                            import json as _json_log
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:policies", "message": "Rerun triggered (policies)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                        except: pass
+                        # #endregion
                         st.rerun()
             else:
                 _auto_refresh_results(st.session_state.get("sources") or [])
+                # #region agent log
+                try:
+                    import json as _json_log
+                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:policies_auto", "message": "Auto rerun (policies)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                except: pass
+                # #endregion
                 st.rerun()
         st.markdown("""<h3 class="section-header">📈 Policy Insights - Comparative Policy Evaluation</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
@@ -9138,14 +9339,35 @@ def render_streamlit_app():
     elif nav_key == "evpi" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
         if st.session_state.get("results_stale"):
+            # #region agent log
+            try:
+                import json as _json_log
+                with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:evpi", "message": "Results stale branch (evpi)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+            except: pass
+            # #endregion
             if use_real_data:
                 st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
                 if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
                     if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_evpi", use_container_width=True):
-                        _auto_refresh_results(st.session_state.get("sources") or [])
+                        _auto_refresh_results(st.session_state.get("sources") or [], allow_real_data=True)
+                        # #region agent log
+                        try:
+                            import json as _json_log
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:evpi", "message": "Rerun triggered (evpi)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                        except: pass
+                        # #endregion
                         st.rerun()
             else:
                 _auto_refresh_results(st.session_state.get("sources") or [])
+                # #region agent log
+                try:
+                    import json as _json_log
+                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:evpi_auto", "message": "Auto rerun (evpi)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
+                except: pass
+                # #endregion
                 st.rerun()
         st.markdown("""<h3 class="section-header">💰 EVPI Focus - Expected Value of Perfect Information</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
