@@ -14,8 +14,3 @@ uvicorn>=0.21.0
 matplotlib>=3.6.0
 requests>=2.28.0
 pyomo>=6.5.0
-<<<<<<< HEAD
-=======
-
-
->>>>>>> 4ece0168dc11298d0c6eaba9bf12f5226a763723
