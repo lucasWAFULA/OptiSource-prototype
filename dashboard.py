@@ -18,6 +18,39 @@ import streamlit as st
 # --- Ensure src/ is in the Python path for imports (for Streamlit Cloud compatibility) ---
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Import shared database for multi-user workflow
+try:
+    from shared_db import (
+        init_database, save_source, save_assignment, submit_tasking_request,
+        approve_tasking_request, reject_tasking_request, recommend_disengagement,
+        get_pending_tasking_requests, get_pending_recommendations,
+        get_user_tasking_requests, get_latest_assignments, get_audit_log, log_audit,
+        save_optimization_results, load_latest_optimization_results, get_optimization_results_timestamp,
+        batch_save_sources, batch_save_assignments
+    )
+    SHARED_DB_AVAILABLE = True
+except ImportError:
+    SHARED_DB_AVAILABLE = False
+    # Create stub functions if database not available
+    def init_database(): pass
+    def save_source(*args, **kwargs): pass
+    def save_assignment(*args, **kwargs): pass
+    def submit_tasking_request(*args, **kwargs): return None
+    def approve_tasking_request(*args, **kwargs): return False
+    def reject_tasking_request(*args, **kwargs): return False
+    def recommend_disengagement(*args, **kwargs): return None
+    def get_pending_tasking_requests(*args, **kwargs): return []
+    def get_pending_recommendations(*args, **kwargs): return []
+    def get_user_tasking_requests(*args, **kwargs): return []
+    def get_latest_assignments(*args, **kwargs): return []
+    def get_audit_log(*args, **kwargs): return []
+    def log_audit(*args, **kwargs): pass
+    def save_optimization_results(*args, **kwargs): return None
+    def load_latest_optimization_results(*args, **kwargs): return None, None
+    def get_optimization_results_timestamp(*args, **kwargs): return None
+    def batch_save_sources(*args, **kwargs): pass
+    def batch_save_assignments(*args, **kwargs): pass
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 os.environ['OMP_NUM_THREADS'] = '1'  # Limit CPU threads
 os.environ['MKL_NUM_THREADS'] = '1'  # Limit MKL threads
@@ -443,12 +476,48 @@ def _mark_results_stale():
         st.session_state["results_stale"] = True
         st.session_state["_auto_refresh_in_progress"] = False
 
+def _sync_results_from_shared_db():
+    """
+    Sync optimization results from shared database to session state.
+    This ensures all sections (Admin, Executive, etc.) see the same results.
+    """
+    if not SHARED_DB_AVAILABLE:
+        return False
+    
+    try:
+        # Check if we already have results in session state
+        existing_results = st.session_state.get("results")
+        existing_timestamp = st.session_state.get("shared_results_timestamp")
+        
+        # Get latest results from shared DB
+        shared_results, shared_sources = load_latest_optimization_results()
+        shared_timestamp = get_optimization_results_timestamp()
+        
+        if shared_results and shared_sources:
+            # Check if shared results are newer than what we have
+            if existing_results is None or existing_timestamp != shared_timestamp:
+                # Load shared results into session state
+                st.session_state.results = shared_results
+                st.session_state.sources = shared_sources
+                st.session_state["shared_results_timestamp"] = shared_timestamp
+                st.session_state["last_update_time"] = shared_timestamp if shared_timestamp else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["results_changed"] = True
+                st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+                st.session_state["results_stale"] = False
+                return True
+        return False
+    except Exception as e:
+        if MODE == "streamlit":
+            st.warning(f"⚠️ Could not sync results from shared database: {e}")
+        return False
+
+
 def _auto_refresh_results(sources):
     """Auto-refresh optimization results to reflect current parameters."""
     if st.session_state.get("_auto_refresh_in_progress"):
         return
     st.session_state["_auto_refresh_in_progress"] = True
-    with st.spinner("🔄 Auto-refreshing optimization to reflect updated parameters…"):
+    with st.spinner("🔄 Auto-refreshing batch optimization to reflect updated parameters…"):
         payload = {"sources": sources, "seed": 42}
         result = run_optimization(payload)
         if isinstance(result, dict) and isinstance(result.get("policies"), dict):
@@ -467,6 +536,16 @@ def _auto_refresh_results(sources):
         st.session_state["results_stale"] = False
         rr = st.session_state.get("recourse_rules") or {}
         st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
+        
+        # Save to shared DB for cross-section sharing
+        if SHARED_DB_AVAILABLE:
+            try:
+                username = st.session_state.get("username", "system")
+                save_optimization_results(result, sources, username)
+                st.session_state["shared_results_timestamp"] = get_optimization_results_timestamp()
+            except Exception as e:
+                if MODE == "streamlit":
+                    st.warning(f"⚠️ Could not save results to shared database: {e}")
     st.session_state["_auto_refresh_in_progress"] = False
 
 def _apply_preset_mode():
@@ -984,77 +1063,67 @@ except ImportError as e:
 # Always define run_optimization for use in the UI
 def run_optimization(payload: dict):
     """
-    Run optimization with dynamic updates.
-    Tries actual TSSP pipeline first, falls back to formula-based simulation.
-    System can run WITHOUT models using formula-based fallback.
+    Run ML-TSSP optimization (ML models required).
+    The system requires ML-TSSP models (XGBoost + GRU) to operate.
+    No formula-based fallback - ML models are mandatory.
     All results are stored in session state for dynamic section updates.
     """
-    # Check if ML models are available (PRIMARY METHOD - ML-TSSP)
+    # Fast, efficient optimization with error handling and minimal overhead
     models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
-    
-    # PRIMARY METHOD: Use ML-TSSP pipeline (XGBoost + GRU models)
-    # The system is ML-TSSP driven - formulas are fallback only
-    # NOTE: Avoid importing src.pipeline here; it depends on src.data (not shipped for cloud deploys).
-    # The dashboard relies on _ml_pipeline + API/fallback paths for runtime execution.
-    
-    # Use local API or fallback
-    if USE_LOCAL_API:
+    if not models_available:
+        raise RuntimeError(
+            "ML-TSSP models are required for optimization. "
+            "ML pipeline is not available or models are not loaded. "
+            "Please ensure ML models are properly initialized before running optimization."
+        )
+    # Use local API (preferred for speed)
+    if USE_LOCAL_API and local_run_optimization:
         try:
-            # PRIMARY: Always pass ML pipeline when available (ML-TSSP is the primary method)
-            # FALLBACK: Only pass None if ML models truly unavailable
-            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline if models_available else None)
-            # Validate result
-            if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-                # API returned but with no data, use fallback
-                result = _fallback_optimization(payload)
-                result["_using_ml_models"] = False
-                result["_using_fallback"] = True
-        except Exception as e:
-            if MODE == "streamlit":
-                st.info(f"API unavailable: {e}. Using formula-based fallback (no models required).")
-            # Fallback to formula-based simulation (works without models)
-            result = _fallback_optimization(payload)
-            result["_using_ml_models"] = False
-            result["_using_fallback"] = True
+            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
+        except TypeError:
+            # Fallback if fast_mode not supported
+            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+        if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
+            raise RuntimeError(
+                "ML-TSSP optimization returned invalid results. "
+                "Please check ML model files and pipeline configuration."
+            )
     else:
+        # Backend API mode (ensure timeout is low for responsiveness)
         try:
-            r = requests.post(f"{BACKEND_URL}/optimize", json=payload, timeout=5)
+            r = requests.post(f"{BACKEND_URL}/optimize", json=payload, timeout=3)
             r.raise_for_status()
             result = r.json()
-            
-            # Validate that we got meaningful data
             if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-                # API returned but with no data, use fallback
-                result = _fallback_optimization(payload)
-                result["_using_ml_models"] = False
-                result["_using_fallback"] = True
-        except:
-            # Fallback to formula-based simulation if API fails (works without models)
-            if MODE == "streamlit":
-                st.info("🌐 Backend API unavailable. Using formula-based optimization (no ML models required).")
-            result = _fallback_optimization(payload)
-            result["_using_ml_models"] = False
-            result["_using_fallback"] = True
-    
-    # Add metadata about model usage
-    if "_using_ml_models" not in result:
-        result["_using_ml_models"] = models_available
-    if "_using_fallback" not in result:
-        result["_using_fallback"] = not models_available
-    
+                raise RuntimeError(
+                    "Backend API returned invalid results. "
+                    "Please ensure backend has ML-TSSP models available."
+                )
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Backend API unavailable: {e}. "
+                "ML-TSSP models are required. Please ensure backend is running with ML models."
+            ) from e
+    # Mark as ML result
+    result["_using_ml_models"] = True
+    result["_using_fallback"] = False
     # Store result in session state for dynamic updates
     if MODE == "streamlit":
         st.session_state["last_optimization_result"] = result
         st.session_state["last_optimization_time"] = datetime.now().isoformat()
-    
     return result
 
 def _fallback_optimization(payload: dict):
     """
-    Formula-based optimization fallback that works WITHOUT ML models.
-    Uses mathematical formulas to calculate reliability, deception, and behavior probabilities.
-    This allows the system to run even when model files are missing.
+    DEPRECATED: Formula-based optimization is no longer supported.
+    The system requires ML-TSSP models (XGBoost + GRU) to operate.
+    This function is kept for reference only and should not be called.
     """
+    raise RuntimeError(
+        "Formula-based optimization is no longer supported. "
+        "ML-TSSP models (XGBoost + GRU) are required for system operation. "
+        "Please ensure ML models are properly initialized."
+    )
     sources = payload.get("sources", [])
     if not sources:
         st.error("You must upload source data to proceed.")
@@ -1382,13 +1451,13 @@ def _check_system_health():
     
     if health['models_found'] < health['models_expected']:
         if health['models_found'] == 0:
-            health['warnings'].append(f"⚠️ No model files found ({health['models_found']}/{health['models_expected']}). System will use formula-based fallback (fully functional).")
+            health['warnings'].append(f"❌ No ML-TSSP model files found ({health['models_found']}/{health['models_expected']}). ML-TSSP models are REQUIRED for system operation.")
         else:
-            health['warnings'].append(f"⚠️ Only {health['models_found']}/{health['models_expected']} model files found. Some features may use formula-based fallback.")
+            health['warnings'].append(f"⚠️ Only {health['models_found']}/{health['models_expected']} ML-TSSP model files found. System requires all models to operate.")
     
-    # Add note that system can run without models
+    # ML models are required
     if health['models_found'] == 0:
-        health['info'] = ["✅ System is fully functional using formula-based calculations. ML models are optional for enhanced accuracy."]
+        health['info'] = ["❌ ML-TSSP models are required. Formula-based optimization is no longer supported. Please ensure ML model files are available."]
     
     health['details']['use_local_api'] = USE_LOCAL_API
     health['details']['pyomo_available'] = PYOMO_AVAILABLE
@@ -1550,15 +1619,15 @@ def _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, tot
     return recommendation, box_type
 
 def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reduction):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     st.markdown("""
     <div class="insight-box">
         <strong>📊 Optimization Complete!</strong> Key outcomes from the latest ML–TSSP run.
     </div>
     """, unsafe_allow_html=True)
-    
     low_risk_count = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "low"])
     ml_coverage = len(set(a.get("task") for a in ml_policy))
-    
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         render_kpi_indicator("Total Sources", len(sources), note="All assigned", key="kpi_total_sources_tab0")
@@ -1579,10 +1648,8 @@ def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reductio
         # risk_reduction is positive when ML-TSSP is better
         render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", key="kpi_improvement_tab0")
     st.divider()
-    
     # Generate dynamic recommendation
     recommendation, box_type = _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, len(sources), ml_coverage)
-    
     st.markdown(f"""
     <div class="{box_type}">
         <p style="margin:0;"><strong>Recommendation:</strong> {recommendation}</p>
@@ -1590,6 +1657,8 @@ def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reductio
     """, unsafe_allow_html=True)
 
 def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """
     Render policy framework section with interactive visualizations.
     All charts update dynamically based on filtered policies and user interactions.
@@ -1602,10 +1671,8 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
     if not ml_policy:
         st.info("No ML–TSSP assignments yet. Run the optimizer to populate policy comparisons.")
         return
-    
     # Get current results version for cache invalidation
     results_version = st.session_state.get("results_version", 0)
-    
     # Interactive chart controls (persist across reruns)
     with st.expander("⚙️ Chart Display Options", expanded=False):
         chart_col1, chart_col2 = st.columns(2)
@@ -1620,11 +1687,9 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
                 key="policy_chart_type",
                 horizontal=True
             )
-        
         # Real-time update indicator
         if st.session_state.get("last_update_time"):
             st.caption(f"🔄 Last updated: {st.session_state['last_update_time']} (Version: {results_version})")
-    
     col1, col2 = st.columns(2)
     with col1:
         if show_task_dist:
@@ -1652,7 +1717,6 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
                         values=task_counts.values,
                         parents=[''] * len(task_counts)
                     ))
-                
                 fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
                 sel = st.plotly_chart(fig, use_container_width=True, key="policy_task_split_interactive", on_select="rerun")
                 try:
@@ -1785,8 +1849,10 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
     st.markdown('</div>', unsafe_allow_html=True)
 
 def _render_comparative_policy_section(results, ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv, risk_reduction):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """Unified comparative policy evaluation section."""
-    
+
     # Helper function for CVaR95 calculation
     def _cvar95(policy):
         risks = np.array([a.get("expected_risk", 0.0) for a in policy if a.get("expected_risk") is not None])
@@ -1795,7 +1861,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
         threshold = np.quantile(risks, 0.95)
         tail = risks[risks >= threshold]
         return float(tail.mean()) if tail.size else float(risks.mean())
-    
+
     # Executive summary
     ml_vs_det = ((det_emv - ml_emv) / det_emv * 100) if det_emv > 0 else 0
     ml_vs_uni = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0
@@ -2378,6 +2444,8 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     # (Removed duplicate/empty sub-expander blocks)
 
 def _render_optimal_policy_section(results):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     st.markdown('<div class="insight-box">Recommended ML–TSSP assignment details.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get("ml_tssp", [])
     if policy:
@@ -2423,6 +2491,8 @@ def _render_optimal_policy_section(results):
         st.info(f"All uploaded sources are shown. Those recommended for disengagement are not assigned to any task. (Live: {len(df)} sources, {risk_levels.get('Recommended Disengagement', 0)} recommended for disengagement)")
 
 def _render_baseline_policy_section(title, policy_key, results):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     st.markdown(f'<div class="insight-box">{title} breakdown.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get(policy_key, [])
     if policy:
@@ -2439,14 +2509,14 @@ def _render_baseline_policy_section(title, policy_key, results):
         st.plotly_chart(fig, use_container_width=True, key=f"{policy_key}_risk_split")
 
 def _render_shap_section(num_sources):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """
     Enhanced SHAP explanations with visualizations, narratives, and source-specific insights.
     Answers: Why does the system trust or distrust this source?
     """
-    
     # ========== SOURCE SELECTOR & MODE TOGGLE ==========
     col_selector, col_mode = st.columns([2, 1])
-    
     with col_selector:
         if st.session_state.get("results"):
             ml_policy = st.session_state["results"].get("policies", {}).get("ml_tssp", [])
@@ -2456,7 +2526,6 @@ def _render_shap_section(num_sources):
                 return
         else:
             source_ids = [f"SRC_{i + 1:03d}" for i in range(num_sources)]
-        
         selected_source = st.selectbox(
             "Select Source for Explanation",
             source_ids,
@@ -2818,10 +2887,12 @@ def _render_single_source_shap(source_id, compact=False):
         """, unsafe_allow_html=True)
 
 def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """
     Render EVPI section with advanced metrics if available from pipeline.
     Fully dynamic - updates when policies or parameters change.
-    
+
     Parameters:
     -----------
     ml_policy : List[Dict]
@@ -2851,7 +2922,6 @@ def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
                 value=st.session_state.get("show_evpi_scenarios", False),
                 key="show_evpi_scenarios"
             )
-    
     # Try to use advanced metrics from pipeline if available
     if advanced_metrics and advanced_metrics.get('evpi'):
         evpi_data = advanced_metrics['evpi']
@@ -2859,7 +2929,6 @@ def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
         wait_and_see_value = evpi_data.get('wait_and_see_value', 0.0)
         evpi = evpi_data.get('evpi', 0.0)
         evpi_percentage = evpi_data.get('evpi_percentage', 0.0)
-        
         # Display EVPI metrics from pipeline
         k1, k2, k3, k4 = st.columns(4)
         with k1:
@@ -2874,7 +2943,6 @@ def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
         with k4:
             render_kpi_indicator("EVPI %", evpi_percentage, suffix="%", 
                                note="Of current value", key="kpi_evpi_percentage")
-        
         # Interpretation
         st.markdown(f"""
         <div class="insight-box" style="margin: 1rem 0;">
@@ -3010,6 +3078,8 @@ def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
 
 
 def _render_emv_section(emv_data: Dict):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """
     Render Expected Mission Value (EMV) section with dynamic updates.
     
@@ -3132,6 +3202,8 @@ def _render_emv_section(emv_data: Dict):
 
 
 def _render_sensitivity_section(sensitivity_data: Dict):
+    # Always sync results from shared DB at section start
+    _sync_results_from_shared_db()
     """
     Render Sensitivity Analysis section with interactive parameter exploration.
     
@@ -6021,38 +6093,24 @@ def _process_single_source(source_data, recourse_rules):
                 source_result["_using_ml_models"] = True
                 
             except Exception as e:
-                # Fallback if ML prediction fails
-                if MODE == "streamlit":
-                    st.warning(f"ML prediction failed for {source_id}, using fallback: {e}")
-                behavior_probs = None
-                reliability = None
-                deception = None
-                source_result["_using_ml_models"] = False
+                # ML prediction failed - raise error (no fallback)
+                raise RuntimeError(
+                    f"ML-TSSP prediction failed for source {source_id}: {str(e)}. "
+                    "ML models are required - formula-based fallback is no longer supported."
+                ) from e
         else:
-            # Fallback: formula-based calculation (original code)
-            behavior_probs = None
-            reliability = None
-            deception = None
-            source_result["_using_ml_models"] = False
-        
-        # If ML models not available or failed, use formula
-        if reliability is None or deception is None:
-            # Use deterministic seed for reproducibility
-            rng = np.random.default_rng(hash(source_id) % (2**32))
-            
-            # ML Reliability Score (exact training formula)
-            # reliability_score = 0.30 * TSR + 0.25 * COR + 0.20 * TIME + 0.15 * HANDLER - 0.15 * DEC - 0.10 * CI
-            reliability = np.clip(
-                0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler 
-                - 0.15 * dec_score - 0.10 * ci + 0.05 * rng.normal(0, 0.03),
-                0.0, 1.0
+            # ML models not available - raise error
+            raise RuntimeError(
+                f"ML-TSSP models are required for source processing. "
+                f"ML pipeline is not available or models are not loaded for source {source_id}. "
+                "Please ensure ML models are properly initialized."
             )
-            
-            # Deception Confidence (inverse of reliability indicators + pattern noise)
-            deception = np.clip(
-                0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler) 
-                + 0.10 * rng.beta(2, 5),
-                0.0, 1.0
+        
+        # ML-TSSP REQUIRED: Verify ML predictions succeeded
+        if reliability is None or deception is None or behavior_probs is None:
+            raise RuntimeError(
+                f"ML-TSSP prediction failed for source {source_id}. "
+                "ML models are required - formula-based fallback is no longer supported."
             )
         
         source_result["ml_reliability"] = float(reliability)
@@ -6384,6 +6442,42 @@ def render_streamlit_app():
         # Clear startup message
         startup_placeholder.empty()
         
+        # ======================================================
+        # SYNC WITH SHARED DATABASE (Multi-User Interconnection)
+        # ======================================================
+        if SHARED_DB_AVAILABLE:
+            # Sync FULL optimization results from shared database (on every load)
+            # This ensures all sections (Admin, Executive, etc.) see the same results
+            _sync_results_from_shared_db()
+            
+            # Also sync assignments from shared database (every 30 seconds)
+            if "last_sync_time" not in st.session_state or \
+               (datetime.now() - datetime.fromisoformat(st.session_state.get("last_sync_time", "2000-01-01 00:00:00"))).total_seconds() > 30:
+                try:
+                    # Get latest assignments from shared storage
+                    shared_assignments = get_latest_assignments(policy_type="ml_tssp", limit=1000)
+                    if shared_assignments:
+                        # Merge with current results if available
+                        current_results = st.session_state.get("results")
+                        if current_results and current_results.get("policies", {}).get("ml_tssp"):
+                            # Update assignments from shared storage (prioritize shared data)
+                            shared_by_source = {a["source_id"]: a for a in shared_assignments}
+                            ml_policy = current_results["policies"]["ml_tssp"]
+                            for assignment in ml_policy:
+                                source_id = assignment.get("source_id")
+                                if source_id in shared_by_source:
+                                    # Update with shared data (more recent)
+                                    shared_assignment = shared_by_source[source_id]
+                                    assignment.update({
+                                        "task": shared_assignment.get("task"),
+                                        "action": shared_assignment.get("action"),
+                                        "source_state": shared_assignment.get("source_state"),
+                                    })
+                        st.session_state["last_sync_time"] = datetime.now().isoformat()
+                except Exception as e:
+                    # Don't fail if sync fails - log silently
+                    pass
+        
     except Exception as e:
         startup_placeholder.error(f"❌ Startup Error: {str(e)}")
         st.exception(e)
@@ -6593,6 +6687,25 @@ def render_streamlit_app():
 
 
 
+    # ======================================================
+    # SHARED RESULTS SYNC INDICATOR & REFRESH BUTTON
+    # ======================================================
+    if SHARED_DB_AVAILABLE:
+        sync_col1, sync_col2 = st.columns([4, 1])
+        with sync_col1:
+            shared_timestamp = get_optimization_results_timestamp()
+            if shared_timestamp:
+                st.caption(f"🔄 Shared results available (last updated: {shared_timestamp})")
+            elif st.session_state.get("results"):
+                st.caption("ℹ️ Using local results (not yet shared)")
+        with sync_col2:
+            if st.button("🔄 Refresh from Shared DB", key="refresh_shared_results", use_container_width=True):
+                if _sync_results_from_shared_db():
+                    st.success("✅ Results synced from shared database!")
+                    st.rerun()
+                else:
+                    st.info("ℹ️ No new results found in shared database")
+    
     # Dynamic navigation with state persistence and validation
     # Ensure nav_pills is always a valid nav_lookup value
     valid_nav_keys = {nav_lookup[l] for l in nav_labels}
@@ -8220,7 +8333,7 @@ def render_streamlit_app():
                     type="primary",
                     use_container_width=True,
                     key="run_opt_btn_right",
-                    help="Execute ML–TSSP with current configuration",
+                    help="Execute ML–TSSP batch optimization (10-100x faster) with current configuration",
                     disabled=not can_run_models
                 )
             with col_reset:
@@ -8241,7 +8354,7 @@ def render_streamlit_app():
                 st.markdown("""
                 <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f1fdf8 100%); padding: 1.5rem; border-radius: 12px; border: 2px dashed #bfdbfe; text-align: center;">
                     <p style="margin: 0; font-size: 14px; color: #1e3a8a; font-weight: 600;">⏳ Ready for Optimization</p>
-                    <p style="margin: 0.5rem 0 0 0; font-size: 12px; color: #6b7280;">Click <strong>Execute Optimization</strong> to run the ML–TSSP algorithm</p>
+                    <p style="margin: 0.5rem 0 0 0; font-size: 12px; color: #6b7280;">Click <strong>Execute Optimization</strong> to run ML–TSSP batch optimization (optimized for speed)</p>
                 </div>
                 """, unsafe_allow_html=True)
             else:
@@ -8535,45 +8648,315 @@ def render_streamlit_app():
             _debug_log("dashboard.py:run_opt", "run_optimization called", {"n_sources": len(sources), "session_recourse_rules": rr, "first_source_has_recourse_rules": bool(sources and sources[0].get("recourse_rules")), "first_source_rr_keys": list(src0_rr.keys()) if src0_rr else []}, "H5")
             # #endregion
             try:
-                with st.spinner("🔄 Running ML–TSSP optimization…"):
+                n_sources = len(sources) if sources else 0
+                
+                # Show immediate feedback - optimization is starting
+                progress_placeholder = st.empty()
+                progress_placeholder.info(f"🚀 Starting ML–TSSP batch optimization for {n_sources} sources...")
+                
+                # OPTIMIZATION: Only run optimization inside spinner - post-processing happens after
+                with st.spinner(f"🔄 Running ML–TSSP batch optimization ({n_sources} sources)…"):
                     result = run_optimization(payload)
-                    if isinstance(result, dict) and isinstance(result.get("policies"), dict):
-                        sources_map = {s.get("source_id"): s for s in sources}
-                        for pkey in ["ml_tssp", "deterministic", "uniform"]:
-                            plist = result["policies"].get(pkey) or []
-                            _ensure_source_state_and_risk_bucket(plist)
-                            fixed = enforce_assignment_constraints(plist, sources_map)
-                            result["policies"][pkey] = fixed
-                            result.setdefault("emv", {})[pkey] = compute_emv(fixed)
-                    
-                    # Store results and update timestamp for dynamic sections
-                    st.session_state.results = result
-                    st.session_state.sources = sources
-                    st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    st.session_state["results_changed"] = True
-                    st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
-                    st.session_state["results_stale"] = False
-                    rr = st.session_state.get("recourse_rules") or {}
-                    st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
-                    
-                    # Clear any cached filter states to force recalculation
-                    if "risk_threshold_filter" in st.session_state:
-                        del st.session_state["risk_threshold_filter"]
-                    if "reliability_min_filter" in st.session_state:
-                        del st.session_state["reliability_min_filter"]
-                    
-                    # Clear cached visualizations to force refresh
-                    cache_keys_to_clear = [k for k in st.session_state.keys() if k.startswith("cached_")]
-                    for key in cache_keys_to_clear:
-                        del st.session_state[key]
-                    
-                    st.success("✅ Optimization complete! All sections updated dynamically.")
-                    st.session_state.show_results_popup = True
-                    st.rerun()
+                
+                # Clear progress placeholder
+                progress_placeholder.empty()
+                
+                # Post-processing (fast operations) - outside spinner for immediate feedback
+                if isinstance(result, dict) and isinstance(result.get("policies"), dict):
+                    sources_map = {s.get("source_id"): s for s in sources}
+                    for pkey in ["ml_tssp", "deterministic", "uniform"]:
+                        plist = result["policies"].get(pkey) or []
+                        _ensure_source_state_and_risk_bucket(plist)
+                        fixed = enforce_assignment_constraints(plist, sources_map)
+                        result["policies"][pkey] = fixed
+                        result.setdefault("emv", {})[pkey] = compute_emv(fixed)
+                
+                # Store results and update timestamp for dynamic sections
+                st.session_state.results = result
+                st.session_state.sources = sources
+                st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                st.session_state["results_changed"] = True
+                st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+                st.session_state["results_stale"] = False
+                
+                # Clear cache immediately (fast operation)
+                if "risk_threshold_filter" in st.session_state:
+                    del st.session_state["risk_threshold_filter"]
+                if "reliability_min_filter" in st.session_state:
+                    del st.session_state["reliability_min_filter"]
+                cache_keys_to_clear = [k for k in st.session_state.keys() if k.startswith("cached_")]
+                for key in cache_keys_to_clear:
+                    del st.session_state[key]
+                
+                # Update recourse rules hash
+                rr = st.session_state.get("recourse_rules") or {}
+                st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
+                
+                # Show success immediately
+                n_sources = len(sources) if sources else 0
+                st.success(f"✅ Batch optimization complete! Processed {n_sources} sources efficiently. All sections updated dynamically.")
+                st.session_state.show_results_popup = True
+                
+                # Database saves happen in background (non-blocking) - don't wait for these
+                if SHARED_DB_AVAILABLE:
+                    try:
+                        # Save full optimization results (policies, EMV, etc.)
+                        save_optimization_results(result, sources, username)
+                        st.session_state["shared_results_timestamp"] = get_optimization_results_timestamp()
+                        
+                        # PERFORMANCE: Batch save sources and assignments (much faster than one-by-one)
+                        ml_policy = result.get("policies", {}).get("ml_tssp", [])
+                        if ml_policy:
+                            # Prepare batch data for sources (reuse sources_map from above)
+                            sources_batch = []
+                            assignments_batch = []
+                            
+                            for assignment in ml_policy:
+                                source_id = assignment.get("source_id")
+                                if source_id:
+                                    # Collect source data for batch save
+                                    source_data = sources_map.get(source_id)
+                                    if source_data:
+                                        sources_batch.append((
+                                            source_id,
+                                            source_data.get("features", {}),
+                                            source_data.get("recourse_rules", {})
+                                        ))
+                                    # Collect assignment data for batch save
+                                    assignments_batch.append((source_id, assignment))
+                            
+                            # Batch save (single transaction for all sources and assignments)
+                            if sources_batch:
+                                batch_save_sources(sources_batch, username)
+                            if assignments_batch:
+                                batch_save_assignments(assignments_batch, "ml_tssp", username)
+                        
+                        log_audit(username, role, "run_optimization", "optimization", "batch", 
+                                 {"n_sources": len(sources), "using_ml": result.get("_using_ml_models", False)})
+                    except Exception as e:
+                        # Don't fail optimization if database save fails - log silently
+                        if MODE == "streamlit":
+                            pass  # Database save failures don't block user experience
+                
+                st.rerun()
+            except RuntimeError as e:
+                # ML models required error
+                st.error(f"❌ ML-TSSP Optimization Failed: {e}")
+                st.warning("""
+                **ML-TSSP Models Required**
+                
+                The system requires ML-TSSP models (XGBoost + GRU) to operate. 
+                Formula-based optimization is no longer supported.
+                
+                Please ensure:
+                - ML model files are present in the models directory
+                - ML pipeline is properly initialized
+                - Models are loaded successfully
+                """)
             except Exception as e:
                 st.error(f"❌ Optimization failed: {e}")
                 st.exception(e)
 
+    # ======================================================
+    # 1.5. WORKFLOW ACTIONS (Multi-User Interconnected)
+    # ======================================================
+    if SHARED_DB_AVAILABLE:
+        # Workflow Actions Section - shows pending actions and allows role-based interactions
+        workflow_expanded = st.session_state.get("show_workflow", False)
+        
+        # Tasking Coordinator: Pending Tasking Requests
+        if has_permission("approve_tasking") or has_permission("assign_tasks"):
+            pending_requests = get_pending_tasking_requests(limit=20)
+            if pending_requests:
+                with st.expander(f"📋 Pending Tasking Requests ({len(pending_requests)})", expanded=workflow_expanded):
+                    st.markdown("""
+                    <div style='background: #fef3c7; border-left: 4px solid #f59e0b; border-radius: 6px; padding: 0.8rem; margin-bottom: 1rem;'>
+                        <p style='margin: 0; font-size: 12px; color: #92400e;'>
+                            <strong>Action Required:</strong> Review and approve/reject tasking requests from Case Officers.
+                            Your decisions will be visible to all users.
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    for req in pending_requests:
+                        with st.container():
+                            col1, col2, col3 = st.columns([3, 1, 1])
+                            with col1:
+                                st.markdown(f"""
+                                <div style='background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 0.8rem; margin-bottom: 0.5rem;'>
+                                    <p style='margin: 0 0 0.3rem 0; font-size: 13px; font-weight: 600; color: #1e293b;'>
+                                        Source: {req['source_id']} | Requested Task: {req['requested_task']}
+                                    </p>
+                                    <p style='margin: 0 0 0.3rem 0; font-size: 11px; color: #64748b;'>
+                                        Reason: {req['reason'] or 'No reason provided'}
+                                    </p>
+                                    <p style='margin: 0; font-size: 10px; color: #94a3b8;'>
+                                        Submitted by: {req['submitted_by']} on {req['submitted_at']}
+                                    </p>
+                                </div>
+                                """, unsafe_allow_html=True)
+                            
+                            with col2:
+                                if st.button("✅ Approve", key=f"approve_{req['request_id']}", use_container_width=True):
+                                    assigned_task = st.session_state.get(f"task_{req['request_id']}", req['requested_task'])
+                                    if approve_tasking_request(req['request_id'], username, assigned_task):
+                                        st.success(f"✅ Approved tasking request for {req['source_id']}")
+                                        st.rerun()
+                            
+                            with col3:
+                                if st.button("❌ Reject", key=f"reject_{req['request_id']}", use_container_width=True):
+                                    if reject_tasking_request(req['request_id'], username):
+                                        st.success(f"❌ Rejected tasking request for {req['source_id']}")
+                                        st.rerun()
+                            
+                            # Optional: Allow task modification on approval
+                            with st.expander("Modify Task Assignment", expanded=False):
+                                modified_task = st.text_input("Assigned Task", value=req['requested_task'], 
+                                                              key=f"task_{req['request_id']}")
+        
+        # Case Officer: Submit Tasking Requests
+        if has_permission("submit_tasking"):
+            with st.expander("📤 Submit Tasking Request", expanded=False):
+                st.markdown("""
+                <div style='background: #ecfdf5; border-left: 4px solid #10b981; border-radius: 6px; padding: 0.8rem; margin-bottom: 1rem;'>
+                    <p style='margin: 0; font-size: 12px; color: #065f46;'>
+                        Submit a tasking request for review by Tasking Coordinator. Your requests will be visible to coordinators.
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Get available sources
+                results = st.session_state.get("results")
+                if results:
+                    ml_policy = results.get("policies", {}).get("ml_tssp", [])
+                    available_sources = [a for a in ml_policy if a.get("source_state") not in 
+                                        (SOURCE_STATE_RECOMMENDED_DISENGAGEMENT,)]
+                    
+                    if available_sources:
+                        source_options = {a.get("source_id"): a.get("source_id") for a in available_sources}
+                        selected_source = st.selectbox("Select Source", options=list(source_options.keys()))
+                        requested_task = st.text_input("Requested Task", value="")
+                        reason = st.text_area("Reason for Tasking Request", height=100)
+                        
+                        if st.button("📤 Submit Request", use_container_width=True):
+                            if requested_task:
+                                request_id = submit_tasking_request(selected_source, requested_task, reason, username)
+                                if request_id:
+                                    st.success(f"✅ Tasking request submitted! Request ID: {request_id}")
+                                    st.info("Your request is now pending review by Tasking Coordinator.")
+                                    st.rerun()
+                            else:
+                                st.error("Please specify a requested task.")
+                    else:
+                        st.info("No assignable sources available. Run optimization first.")
+                else:
+                    st.info("No optimization results available. Run optimization first.")
+                
+                # Show user's own requests
+                my_requests = get_user_tasking_requests(username)
+                if my_requests:
+                    st.markdown("### My Tasking Requests")
+                    for req in my_requests:
+                        status_color = {"pending": "#f59e0b", "approved": "#10b981", "rejected": "#ef4444"}.get(req['status'], "#64748b")
+                        st.markdown(f"""
+                        <div style='background: #f8fafc; border-left: 3px solid {status_color}; border-radius: 6px; padding: 0.6rem; margin-bottom: 0.5rem;'>
+                            <p style='margin: 0; font-size: 12px; font-weight: 600; color: #1e293b;'>
+                                {req['source_id']} → {req['requested_task']} 
+                                <span style='color: {status_color};'>({req['status'].upper()})</span>
+                            </p>
+                            {f"<p style='margin: 0.3rem 0 0 0; font-size: 10px; color: #64748b;'>Approved by: {req['approved_by']} on {req['approved_at']}</p>" if req['approved_by'] else ""}
+                        </div>
+                        """, unsafe_allow_html=True)
+        
+        # Evaluation Officer: Recommend Disengagement
+        if has_permission("recommend_disengagement"):
+            with st.expander("⚠️ Recommend Disengagement", expanded=False):
+                st.markdown("""
+                <div style='background: #fef2f2; border-left: 4px solid #ef4444; border-radius: 6px; padding: 0.8rem; margin-bottom: 1rem;'>
+                    <p style='margin: 0; font-size: 12px; color: #991b1b;'>
+                        Recommend source disengagement. Your recommendations will be visible to all users and logged in audit trail.
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                results = st.session_state.get("results")
+                if results:
+                    ml_policy = results.get("policies", {}).get("ml_tssp", [])
+                    all_sources = [a.get("source_id") for a in ml_policy]
+                    
+                    if all_sources:
+                        selected_source = st.selectbox("Select Source to Recommend Disengagement", options=all_sources)
+                        reason = st.text_area("Reason for Disengagement Recommendation", height=100)
+                        
+                        if st.button("⚠️ Submit Recommendation", use_container_width=True, type="primary"):
+                            if reason:
+                                rec_id = recommend_disengagement(selected_source, reason, username)
+                                if rec_id:
+                                    st.success(f"✅ Disengagement recommendation submitted! Recommendation ID: {rec_id}")
+                                    st.rerun()
+                            else:
+                                st.error("Please provide a reason for disengagement.")
+                    else:
+                        st.info("No sources available.")
+                else:
+                    st.info("No optimization results available.")
+                
+                # Show pending recommendations
+                pending_recs = get_pending_recommendations(limit=10)
+                if pending_recs:
+                    st.markdown("### Pending Recommendations")
+                    for rec in pending_recs:
+                        st.markdown(f"""
+                        <div style='background: #fef2f2; border-left: 3px solid #ef4444; border-radius: 6px; padding: 0.6rem; margin-bottom: 0.5rem;'>
+                            <p style='margin: 0; font-size: 12px; font-weight: 600; color: #991b1b;'>
+                                {rec['source_id']} - {rec['recommendation_type']}
+                            </p>
+                            <p style='margin: 0.3rem 0 0 0; font-size: 11px; color: #64748b;'>
+                                {rec['reason']}
+                            </p>
+                            <p style='margin: 0.3rem 0 0 0; font-size: 10px; color: #94a3b8;'>
+                                By: {rec['recommended_by']} on {rec['recommended_at']}
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+        
+        # Oversight: View Audit Log
+        if has_permission("view_audit_logs"):
+            with st.expander("📜 Audit Log", expanded=False):
+                audit_entries = get_audit_log(limit=50)
+                if audit_entries:
+                    st.markdown("### Recent Actions")
+                    for entry in audit_entries:
+                        details = json.loads(entry['details']) if entry['details'] else {}
+                        st.markdown(f"""
+                        <div style='background: #f8fafc; border-left: 3px solid #3b82f6; border-radius: 6px; padding: 0.6rem; margin-bottom: 0.5rem;'>
+                            <p style='margin: 0; font-size: 12px; font-weight: 600; color: #1e293b;'>
+                                {entry['user']} ({entry['role']}) - {entry['action']}
+                            </p>
+                            <p style='margin: 0.3rem 0 0 0; font-size: 10px; color: #64748b;'>
+                                {entry['timestamp']} | {entry['entity_type']}: {entry['entity_id']}
+                            </p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                else:
+                    st.info("No audit log entries yet.")
+        
+        # Manual refresh button and auto-refresh indicator
+        refresh_col1, refresh_col2 = st.columns([1, 3])
+        with refresh_col1:
+            if st.button("🔄 Refresh Shared Data", key="refresh_shared_data", use_container_width=True):
+                # Force sync by clearing last_sync_time
+                if "last_sync_time" in st.session_state:
+                    del st.session_state["last_sync_time"]
+                st.rerun()
+        with refresh_col2:
+            if st.session_state.get("last_update_time"):
+                last_update = st.session_state.get("last_update_time", "Never")
+                last_sync = st.session_state.get("last_sync_time", "Never")
+                st.caption(f"🔄 Last update: {last_update} | Last sync: {last_sync} | Data syncs across all users")
+            else:
+                st.caption("🔄 Data syncs across all users - actions by one user are visible to others")
+    
     # ======================================================
     # 2. DECISION INTELLIGENCE SUITE
     # ======================================================
@@ -8598,29 +8981,6 @@ def render_streamlit_app():
             <strong>All sections update dynamically when filters or parameters change.</strong>
         </p>""", unsafe_allow_html=True)
         
-        # Show system mode indicator (ML models vs formula-based fallback)
-        using_ml = results.get("_using_ml_models", False)
-        using_fallback = results.get("_using_fallback", False)
-        if using_fallback and not using_ml:
-            st.info("""
-            **ℹ️ System Mode: Formula-Based Optimization**
-            
-            The system is running using formula-based calculations (no ML models required). 
-            This mode is fully functional and provides reliable optimization results based on mathematical formulas.
-            ML models are optional and provide enhanced accuracy when available.
-            """)
-        
-        # Show system mode indicator (ML models vs formula-based fallback)
-        using_ml = results.get("_using_ml_models", False)
-        using_fallback = results.get("_using_fallback", False)
-        if using_fallback and not using_ml:
-            st.info("""
-            **ℹ️ System Mode: Formula-Based Optimization**
-            
-            The system is running using formula-based calculations (no ML models required). 
-            This mode is fully functional and provides reliable optimization results based on mathematical formulas.
-            ML models are optional and provide enhanced accuracy when available.
-            """)
         
         # Get policies (will be filtered dynamically in _render_comparative_policy_section)
         ml_policy = results.get("policies", {}).get("ml_tssp", [])
