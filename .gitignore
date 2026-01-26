@@ -78,3 +78,7 @@ Thumbs.db
 
 # Streamlit
 .streamlit/
+
+# Shared database (runtime data)
+shared_state.db
+*.db
