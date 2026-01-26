@@ -33,7 +33,10 @@ MODE = "streamlit"  # options: "streamlit", "api", "batch"
 MAX_SOURCES = 500
 MAX_TASKS = 50
 
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 from datetime import datetime, timedelta
 import uuid
 import hashlib
@@ -986,19 +989,19 @@ def run_optimization(payload: dict):
     System can run WITHOUT models using formula-based fallback.
     All results are stored in session state for dynamic section updates.
     """
-    # Check if ML models are available
+    # Check if ML models are available (PRIMARY METHOD - ML-TSSP)
     models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
     
-    # Try to use actual TSSP pipeline if models are available
+    # PRIMARY METHOD: Use ML-TSSP pipeline (XGBoost + GRU models)
+    # The system is ML-TSSP driven - formulas are fallback only
     # NOTE: Avoid importing src.pipeline here; it depends on src.data (not shipped for cloud deploys).
     # The dashboard relies on _ml_pipeline + API/fallback paths for runtime execution.
-    if models_available:
-        pass
     
     # Use local API or fallback
     if USE_LOCAL_API:
         try:
-            # Pass ML pipeline to api.py if available
+            # PRIMARY: Always pass ML pipeline when available (ML-TSSP is the primary method)
+            # FALLBACK: Only pass None if ML models truly unavailable
             result = local_run_optimization(payload, ml_pipeline=_ml_pipeline if models_available else None)
             # Validate result
             if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):

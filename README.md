@@ -1,3 +1,37 @@
+## Role-Based Access Control
+
+This application implements robust role-based access control (RBAC) to ensure that users only access features appropriate to their responsibilities within the intelligence cycle. Each user is assigned a role, which determines their permissions and accessible dashboard features.
+
+### User Roles
+
+- **Case Officer (Handler):** Manages assigned sources, submits tasking, updates field notes, flags risk, and recommends engagement.
+- **Intelligence Analyst:** Views reports, runs models, scores intelligence, and compares sources.
+- **Tasking Coordinator:** Approves tasking, assigns tasks, manages priorities, and views capabilities.
+- **Source Evaluation Officer:** Views longitudinal metrics, validates scores, and recommends disengagement.
+- **Operations Oversight / Legal & Ethics:** Views audit logs, freezes operations, reviews exceptions, and accesses aggregated dashboards.
+- **System Administrator:** Manages users, configures the system, and can export data in bulk. Cannot view intelligence content or source performance data.
+- **Executive / Strategic Viewer:** Views aggregated dashboards for high-level insights.
+
+### Permissions Matrix (Summary)
+
+| Role                   | Key Permissions                                                                 |
+|------------------------|-------------------------------------------------------------------------------|
+| Case Officer           | view_assigned_sources, submit_tasking, update_field_notes, flag_risk, recommend_engagement |
+| Analyst                | view_reports, run_models, score_intelligence, compare_sources                  |
+| Tasking Coordinator    | approve_tasking, assign_tasks, view_capabilities, manage_priorities            |
+| Evaluation Officer     | view_longitudinal_metrics, validate_scores, recommend_disengagement            |
+| Oversight              | view_audit_logs, freeze_operations, review_exceptions, view_aggregated_dashboards |
+| Admin                  | manage_users, configure_system, export_bulk                                    |
+| Executive              | view_aggregated_dashboards                                                     |
+
+### How It Works
+
+- User roles are assigned at login and stored in the session.
+- Each dashboard section checks permissions before displaying sensitive data or controls.
+- Navigation and actions are dynamically enabled/disabled based on the user’s role.
+- Admins cannot view intelligence content or source performance data for security and compliance.
+
+For more details, see the role and permission logic in `dashboard.py`.
 
 # HUMINT Source Performance: ML-TSSP Framework
 

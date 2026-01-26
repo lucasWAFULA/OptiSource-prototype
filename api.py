@@ -26,14 +26,19 @@ ACTION_RISK_MULTIPLIER = {
 def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any]:
     """
     Execute ML-TSSP optimization on provided sources.
-    Uses ML models (XGBoost + GRU) when available, falls back to formulas otherwise.
+    
+    PRIMARY METHOD: Uses ML models (XGBoost + GRU) for all predictions.
+    FALLBACK ONLY: Formula-based calculations are used ONLY when ML models are unavailable or fail.
+    
+    The system is ML-TSSP driven - formulas are a safety fallback, not the primary method.
     
     Args:
         payload: Dictionary containing 'sources' list and 'seed' for RNG
-        ml_pipeline: Optional ML pipeline object with predict methods. If None or not loaded, uses formula fallback.
+        ml_pipeline: ML pipeline object with predict methods. REQUIRED for ML-TSSP operation.
+                     If None or not loaded, system falls back to formulas (not recommended for production).
         
     Returns:
-        Dictionary with 'policies' and 'emv' results, plus '_using_ml_models' flag
+        Dictionary with 'policies' and 'emv' results, plus '_using_ml_models' flag indicating ML usage
     """
     sources = payload.get("sources", [])
     seed = payload.get("seed", 42)
@@ -72,7 +77,7 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             "ci": ci
         }
         
-        # Try to use ML models, fallback to formulas if unavailable or fails
+        # PRIMARY METHOD: Use ML-TSSP models (XGBoost + GRU) for all predictions
         reliability = None
         deception = None
         behavior_probs_ml = None
@@ -80,29 +85,30 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         
         if use_ml_models:
             try:
-                # Use GRU Regressor for reliability score
+                # PRIMARY: Use GRU Regressor for reliability score (ML-TSSP)
                 reliability = ml_pipeline.predict_reliability_score(features_dict)
                 
-                # Use GRU Regressor for deception score
+                # PRIMARY: Use GRU Regressor for deception score (ML-TSSP)
                 deception = ml_pipeline.predict_deception_score(features_dict)
                 
-                # Use XGBoost Classifier for behavior probabilities
+                # PRIMARY: Use XGBoost Classifier for behavior probabilities (ML-TSSP)
                 behavior_probs_lower = ml_pipeline.predict_behavior_probabilities(features_dict)
                 
                 # Convert to lowercase keys format expected by this function
                 behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
                 
-                # Mark that ML models were successfully used
+                # Mark that ML models were successfully used (PRIMARY METHOD)
                 ml_models_used = True
                 
             except Exception:
-                # ML prediction failed, will use formula fallback
+                # ML prediction failed - will fall back to formulas (NOT RECOMMENDED)
                 ml_prediction_failed = True
                 reliability = None
                 deception = None
                 behavior_probs_ml = None
         
-        # Fallback to formula-based calculations if ML not available or failed
+        # FALLBACK ONLY: Use formula-based calculations ONLY if ML not available or failed
+        # This is a safety fallback, not the primary method
         if reliability is None or deception is None:
             # Formula-based reliability calculation (fallback)
             reliability = np.clip(
@@ -139,12 +145,12 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             action = "task"
             task = rng.choice(TASK_ROSTER)
         
-        # Use ML behavior probabilities if available, otherwise use formula-based fallback
+        # PRIMARY: Use ML behavior probabilities (XGBoost), FALLBACK: formulas only if ML unavailable
         if behavior_probs_ml is not None:
-            # Use ML-predicted behavior probabilities (from XGBoost)
+            # PRIMARY METHOD: Use ML-predicted behavior probabilities (from XGBoost Classifier)
             behavior_probs = behavior_probs_ml
         else:
-            # Formula-based behavior probabilities (fallback)
+            # FALLBACK ONLY: Formula-based behavior probabilities (used only when ML unavailable)
             cooperative_prob = max(0.0, min(1.0, reliability * (1 - deception) * 1.2))
             uncertain_prob = max(0.0, min(1.0, (1 - reliability) * 0.4))
             coerced_prob = max(0.0, min(1.0, deception * 0.3))
