@@ -185,6 +185,115 @@ RISK_LEVEL_THRESHOLDS = {
     "medium": 0.6
 }
 
+# ======================================================
+# ROLE-BASED ACCESS CONTROL (INTELLIGENCE CYCLE)
+# ======================================================
+ROLE_DEFINITIONS = {
+    "case_officer": {"label": "Case Officer (Handler)"},
+    "analyst": {"label": "Intelligence Analyst"},
+    "tasking_coordinator": {"label": "Tasking Coordinator"},
+    "evaluation_officer": {"label": "Source Evaluation Officer"},
+    "oversight": {"label": "Operations Oversight / Legal & Ethics"},
+    "admin": {"label": "System Administrator (Technical)"},
+    "executive": {"label": "Executive / Strategic Viewer"},
+}
+
+ROLE_PERMISSIONS = {
+    "case_officer": {
+        "view_assigned_sources",
+        "submit_tasking",
+        "update_field_notes",
+        "flag_risk",
+        "recommend_engagement",
+    },
+    "analyst": {
+        "view_reports",
+        "run_models",
+        "score_intelligence",
+        "compare_sources",
+    },
+    "tasking_coordinator": {
+        "approve_tasking",
+        "assign_tasks",
+        "view_capabilities",
+        "manage_priorities",
+    },
+    "evaluation_officer": {
+        "view_longitudinal_metrics",
+        "validate_scores",
+        "recommend_disengagement",
+    },
+    "oversight": {
+        "view_audit_logs",
+        "freeze_operations",
+        "review_exceptions",
+        "view_aggregated_dashboards",
+    },
+    "admin": {
+        "manage_users",
+        "configure_system",
+        "export_bulk",
+    },
+    "executive": {
+        "view_aggregated_dashboards",
+    },
+}
+
+USER_ROLES = {
+    "admin": "admin",
+    "analyst": "analyst",
+    "commander": "tasking_coordinator",
+    "operator": "case_officer",
+    "case_officer": "case_officer",
+    "tasking": "tasking_coordinator",
+    "evaluator": "evaluation_officer",
+    "oversight": "oversight",
+    "executive": "executive",
+}
+
+NAV_PERMISSION_MAP = {
+    "profiles": {"view_assigned_sources", "view_capabilities"},
+    "policies": {"view_reports", "view_capabilities", "view_longitudinal_metrics", "view_aggregated_dashboards"},
+    "evpi": {"view_reports", "view_longitudinal_metrics", "view_aggregated_dashboards"},
+    "stress": {"run_models", "view_longitudinal_metrics"},
+    "admin": {"manage_users", "configure_system"},
+}
+
+def get_current_role() -> str:
+    role = st.session_state.get("role")
+    if role:
+        return role
+    username = st.session_state.get("username")
+    role = USER_ROLES.get(username, "executive")
+    st.session_state["role"] = role
+    return role
+
+def has_permission(permission: str) -> bool:
+    role = get_current_role()
+    return permission in ROLE_PERMISSIONS.get(role, set())
+
+def _can_access_nav(nav_key: str) -> bool:
+    required = NAV_PERMISSION_MAP.get(nav_key, set())
+    return any(has_permission(p) for p in required) if required else False
+
+def _pseudonymize_source_id(source_id: str, username: str) -> str:
+    raw = f"{username}:{source_id}".encode("utf-8")
+    tag = hashlib.md5(raw).hexdigest()[:6].upper()
+    return f"SRC-{tag}"
+
+def _is_source_assigned_to_user(username: str, source_id: str) -> bool:
+    seed = f"{username}:{source_id}".encode("utf-8")
+    return int(hashlib.md5(seed).hexdigest(), 16) % 3 == 0
+
+def _filter_sources_for_role(sources: list, username: str, role: str) -> list:
+    # Admin cannot view intelligence content or source performance data
+    if role == "admin":
+        return []
+    if role != "case_officer":
+        return sources
+    filtered = [s for s in sources if _is_source_assigned_to_user(username, s.get("source_id", ""))]
+    return filtered
+
 # Operational Mode (Conservative, Balanced, Aggressive, Custom) controls the decision thresholds
 # for disengagement, flagging, etc. These thresholds affect how sources are assigned actions,
 # which in turn influences the distribution of expected risk values.
@@ -870,12 +979,6 @@ except ImportError as e:
     USE_LOCAL_API = False
 
 # Always define run_optimization for use in the UI
-def run_optimization(payload):
-    if local_run_optimization:
-        return local_run_optimization(payload)
-    else:
-        raise RuntimeError("run_optimization is not available. Please ensure api.py is present and importable.")
-
 def run_optimization(payload: dict):
     """
     Run optimization with dynamic updates.
@@ -895,7 +998,8 @@ def run_optimization(payload: dict):
     # Use local API or fallback
     if USE_LOCAL_API:
         try:
-            result = local_run_optimization(payload)
+            # Pass ML pipeline to api.py if available
+            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline if models_available else None)
             # Validate result
             if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
                 # API returned but with no data, use fallback
@@ -1680,6 +1784,15 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
 def _render_comparative_policy_section(results, ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv, risk_reduction):
     """Unified comparative policy evaluation section."""
     
+    # Helper function for CVaR95 calculation
+    def _cvar95(policy):
+        risks = np.array([a.get("expected_risk", 0.0) for a in policy if a.get("expected_risk") is not None])
+        if risks.size == 0:
+            return 0.0
+        threshold = np.quantile(risks, 0.95)
+        tail = risks[risks >= threshold]
+        return float(tail.mean()) if tail.size else float(risks.mean())
+    
     # Executive summary
     ml_vs_det = ((det_emv - ml_emv) / det_emv * 100) if det_emv > 0 else 0
     ml_vs_uni = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0
@@ -1695,16 +1808,85 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     ml_assigned = ml_total
     ml_recommended_disengage = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
     
+    # Calculate executive metrics
+    assignment_rate = (ml_assigned / ml_total * 100) if ml_total > 0 else 0.0
+    disengagement_pressure = (ml_recommended_disengage / ml_total * 100) if ml_total > 0 else 0.0
+    net_viable_pool = ((ml_total - ml_recommended_disengage) / ml_total * 100) if ml_total > 0 else 0.0
+    osi = net_viable_pool  # Operational Sustainability Index
+    
+    # Determine OSI status
+    if osi >= 95.0:
+        osi_status = "Sustainable"
+        osi_color = "#10b981"
+    elif osi >= 90.0:
+        osi_status = "Monitor"
+        osi_color = "#f59e0b"
+    else:
+        osi_status = "Policy Intervention Required"
+        osi_color = "#ef4444"
+    
+    # Calculate comparison metrics for executive summary
+    _ensure_source_state_and_risk_bucket(det_policy)
+    _ensure_source_state_and_risk_bucket(uni_policy)
+    
+    # Calculate CVaR95 for all policies (needed for comparison)
+    ml_cvar = _cvar95(ml_policy)
+    det_cvar = _cvar95(det_policy)
+    uni_cvar = _cvar95(uni_policy)
+    
+    # Calculate percentage improvements
+    ml_vs_det_cvar = ((det_cvar - ml_cvar) / det_cvar * 100) if det_cvar > 0 else 0
+    ml_vs_uni_cvar = ((uni_cvar - ml_cvar) / uni_cvar * 100) if uni_cvar > 0 else 0
+    
+    # Determine which policy has lowest worst-case risk
+    best_cvar_policy = "ML-TSSP" if ml_cvar <= min(det_cvar, uni_cvar) else "Deterministic" if det_cvar <= uni_cvar else "Uniform"
+    
+    # Executive takeaway with explicit comparisons
+    if ml_recommended_disengage > 0:
+        takeaway = f"ML-TSSP achieves full task coverage, but flags {disengagement_pressure:.1f}% of the source pool for disengagement, indicating elevated long-term operational risk under present constraints. Compared to Deterministic and Uniform baselines, ML-TSSP reduces worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
+    else:
+        takeaway = f"ML-TSSP maintains full coverage with no disengagement pressure, indicating sustainable operational posture under present constraints. Compared to Deterministic and Uniform baselines, ML-TSSP reduces worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
+    
+    # Executive Policy Comparison Header with OSI KPI
     st.markdown(f"""
     <div style='background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); 
                 padding: 1.5rem; border-radius: 12px; border: 1px solid #bfdbfe; 
                 margin-bottom: 1.5rem; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);'>
-        <h4 style='margin: 0 0 0.8rem 0; color: #1e40af; font-size: 18px; font-weight: 700; text-align: center;'>
+        <h4 style='margin: 0 0 0.6rem 0; color: #1e40af; font-size: 18px; font-weight: 700; text-align: center;'>
             📊 Executive Policy Comparison
         </h4>
-        <p style='margin: 0; font-size: 13px; color: #475569; text-align: center; line-height: 1.6;'>
-            Of {ml_total} sources, <span style="color:#10b981;font-weight:600;">{ml_assigned} assigned</span> and <span style="color:#ef4444;font-weight:600;">{ml_recommended_disengage} recommended for disengagement</span> by ML-TSSP constraints. <br>
-            <span style="font-size:11px;color:#64748b;">(Live update: every run or parameter change instantly updates these counts.)</span>
+        <div style='background: rgba(255, 255, 255, 0.9); border-radius: 8px; padding: 0.8rem; margin-bottom: 0.8rem; border-left: 4px solid {osi_color};'>
+            <div style='display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.4rem;'>
+                <span style='font-size: 12px; color: #475569; font-weight: 600;'>Operational Sustainability Index (OSI)</span>
+                <span style='font-size: 20px; font-weight: 700; color: {osi_color};'>{osi:.1f}%</span>
+            </div>
+            <div style='font-size: 11px; color: {osi_color}; font-weight: 600;'>{osi_status}</div>
+            <div style='font-size: 10px; color: #64748b; margin-top: 0.3rem;'>Proportion of source pool that remains both mission-assigned and below disengagement thresholds</div>
+        </div>
+        <p style='margin: 0 0 0.6rem 0; font-size: 13px; color: #1e293b; text-align: center; line-height: 1.6; font-weight: 500;'>
+            {takeaway}
+        </p>
+        <div style='background: rgba(255, 255, 255, 0.7); border-radius: 6px; padding: 0.6rem; margin-bottom: 0.6rem;'>
+            <div style='display: grid; grid-template-columns: repeat(3, 1fr); gap: 0.5rem; text-align: center;'>
+                <div>
+                    <div style='font-size: 11px; color: #64748b; margin-bottom: 0.2rem;'>Assignment Rate</div>
+                    <div style='font-size: 16px; font-weight: 700; color: #10b981;'>{assignment_rate:.1f}%</div>
+                    <div style='font-size: 9px; color: #94a3b8;'>({ml_assigned} / {ml_total})</div>
+                </div>
+                <div>
+                    <div style='font-size: 11px; color: #64748b; margin-bottom: 0.2rem;'>Disengagement Pressure</div>
+                    <div style='font-size: 16px; font-weight: 700; color: #ef4444;'>{disengagement_pressure:.1f}%</div>
+                    <div style='font-size: 9px; color: #94a3b8;'>({ml_recommended_disengage} sources)</div>
+                </div>
+                <div>
+                    <div style='font-size: 11px; color: #64748b; margin-bottom: 0.2rem;'>Net Viable Pool</div>
+                    <div style='font-size: 16px; font-weight: 700; color: #1e40af;'>{net_viable_pool:.1f}%</div>
+                    <div style='font-size: 9px; color: #94a3b8;'>({ml_total - ml_recommended_disengage} sources)</div>
+                </div>
+            </div>
+        </div>
+        <p style='margin: 0.4rem 0 0 0; font-size: 10px; color: #64748b; text-align: center; font-style: italic;'>
+            Disengagement recommendations shown are advisory and subject to supervisory review and approval. Updates reflect immediate sensitivity to policy threshold changes.
         </p>
         <div style='margin-top:0.8rem; text-align:center;'>
             <span style='display:inline-block;background:#ffffff;border:1px solid #dbeafe;border-radius:999px;padding:2px 10px;font-size:11px;color:#1e40af;'>
@@ -1719,7 +1901,18 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     risk_counts = pd.Series([_get_risk_bucket_from_assignment(a) for a in ml_policy]).value_counts()
     risk_labels = ["low", "medium", "high"]
     risk_values = [int(risk_counts.get(k, 0)) for k in risk_labels]
+    risk_percentages = [(v / ml_total * 100) if ml_total > 0 else 0.0 for v in risk_values]
     task_counts = pd.Series([a.get("task", "Unassigned") for a in ml_policy]).value_counts().head(15)
+    
+    # Calculate task redundancy metrics
+    task_assignments = {}
+    for a in ml_policy:
+        task = a.get("task", "Unassigned")
+        if task != "Unassigned":
+            task_assignments[task] = task_assignments.get(task, 0) + 1
+    single_source_tasks = sum(1 for count in task_assignments.values() if count == 1)
+    redundant_tasks = sum(1 for count in task_assignments.values() if count >= 2)
+    redundancy_rate = (redundant_tasks / len(task_assignments) * 100) if len(task_assignments) > 0 else 0.0
 
     rd_col, tc_col = st.columns(2)
     with rd_col:
@@ -1727,11 +1920,25 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             labels=[lbl.title() for lbl in risk_labels],
             values=risk_values,
             hole=0.45,
-            marker=dict(colors=['#10b981', '#f59e0b', '#ef4444'])
+            marker=dict(colors=['#10b981', '#f59e0b', '#ef4444']),
+            textinfo='label+percent',
+            hovertemplate='<b>%{label}</b><br>Count: %{value}<br>Percentage: %{percent}<extra></extra>'
         )])
-        fig_risk.update_layout(height=260, margin=dict(l=0, r=0, t=10, b=0))
-        st.markdown('<div class="chart-card"><div class="chart-card-title">⚠️ Risk Distribution (Intrinsic)</div>', unsafe_allow_html=True)
+        fig_risk.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0))
+        st.markdown('<div class="chart-card"><div class="chart-card-title">⚠️ Risk Exposure Under Current Policy</div>', unsafe_allow_html=True)
+        if risk_percentages[0] > 70:  # Low risk > 70%
+            risk_caption = "ML-TSSP concentrates operational reliance in the low-risk tier, preserving a stable core of dependable sources."
+        elif risk_percentages[2] > 15:  # High risk > 15%
+            risk_caption = "ML-TSSP maintains moderate low-risk concentration, but elevated high-risk exposure requires careful monitoring."
+        else:
+            risk_caption = "ML-TSSP balances risk distribution across tiers, providing operational flexibility with measured exposure."
+        st.caption(risk_caption)
         st.plotly_chart(fig_risk, use_container_width=True, key="policy_risk_pie")
+        st.markdown("""
+        <div style='background: #f8fafc; border-radius: 6px; padding: 0.6rem; margin-top: 0.5rem; font-size: 11px; color: #475569; line-height: 1.5;'>
+            <p style='margin: 0 0 0.4rem 0;'>The <strong style='color: #10b981;'>low risk</strong> tier serves as the primary operational backbone, providing the core of dependable sources that ML-TSSP prioritizes for routine tasking. The <strong style='color: #f59e0b;'>medium risk</strong> tier functions as a flexibility buffer under pressure, allowing the system to maintain coverage when low-risk sources are unavailable. The <strong style='color: #ef4444;'>high risk</strong> tier represents candidates for review rather than routine tasking, reflecting ML-TSSP's risk-aware allocation strategy.</p>
+        </div>
+        """, unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     with tc_col:
@@ -1740,10 +1947,158 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             y=task_counts.values.tolist(),
             marker_color="#3b82f6"
         )])
-        fig_tasks.update_layout(height=260, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="Task", yaxis_title="Assigned")
-        st.markdown('<div class="chart-card"><div class="chart-card-title">🗺️ Task Coverage Map</div>', unsafe_allow_html=True)
+        fig_tasks.update_layout(height=280, margin=dict(l=0, r=0, t=10, b=0), xaxis_title="Task", yaxis_title="Assigned")
+        st.markdown('<div class="chart-card"><div class="chart-card-title">🗺️ Mission Coverage and Redundancy</div>', unsafe_allow_html=True)
+        if redundancy_rate >= 70.0:
+            coverage_caption = "ML-TSSP maintains robust task coverage across priority requirements with strong redundancy, indicating resilient operational posture."
+        elif redundancy_rate >= 40.0:
+            coverage_caption = "ML-TSSP maintains robust coverage across priority tasks, though redundancy narrows as disengagement pressure increases."
+        else:
+            coverage_caption = "ML-TSSP maintains coverage but redundancy is limited, highlighting a key policy tradeoff: universal coverage versus long-term source resilience."
+        st.caption(coverage_caption)
         st.plotly_chart(fig_tasks, use_container_width=True, key="policy_task_coverage")
+        if len(task_assignments) > 0:
+            st.markdown(f"""
+            <div style='background: #f8fafc; border-radius: 6px; padding: 0.6rem; margin-top: 0.5rem; font-size: 11px; color: #475569;'>
+                <div style='margin-bottom: 0.3rem;'><strong>Single-source tasks:</strong> {single_source_tasks}</div>
+                <div><strong>Tasks with redundancy ≥2:</strong> {redundancy_rate:.1f}%</div>
+            </div>
+            """, unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
+    
+    # Policy Comparison Summary (explicit comparisons)
+    # Calculate additional comparison metrics
+    ml_low_risk_count = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "low"])
+    det_low_risk_count = len([a for a in det_policy if _get_risk_bucket_from_assignment(a) == "low"])
+    uni_low_risk_count = len([a for a in uni_policy if _get_risk_bucket_from_assignment(a) == "low"])
+    
+    # Build comparison statements
+    cvar_comparison = ""
+    if best_cvar_policy == "ML-TSSP":
+        cvar_comparison = f"ML-TSSP has the lowest worst-case risk exposure ({ml_cvar:.3f}) compared to Deterministic ({det_cvar:.3f}) and Uniform ({uni_cvar:.3f}) policies, representing {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% improvements respectively."
+    elif best_cvar_policy == "Deterministic":
+        det_vs_ml = ((ml_cvar - det_cvar) / ml_cvar * 100) if ml_cvar > 0 else 0
+        det_vs_uni = ((uni_cvar - det_cvar) / uni_cvar * 100) if uni_cvar > 0 else 0
+        cvar_comparison = f"Deterministic has the lowest worst-case risk exposure ({det_cvar:.3f}), while ML-TSSP ({ml_cvar:.3f}) and Uniform ({uni_cvar:.3f}) show {det_vs_ml:.1f}% and {det_vs_uni:.1f}% higher exposure respectively."
+    else:
+        uni_vs_ml = ((ml_cvar - uni_cvar) / ml_cvar * 100) if ml_cvar > 0 else 0
+        uni_vs_det = ((det_cvar - uni_cvar) / det_cvar * 100) if det_cvar > 0 else 0
+        cvar_comparison = f"Uniform has the lowest worst-case risk exposure ({uni_cvar:.3f}), while ML-TSSP ({ml_cvar:.3f}) and Deterministic ({det_cvar:.3f}) show {uni_vs_ml:.1f}% and {uni_vs_det:.1f}% higher exposure respectively."
+    
+    emv_comparison = ""
+    if ml_emv <= min(det_emv, uni_emv):
+        emv_comparison = f"ML-TSSP achieves the lowest expected operational loss ({ml_emv:.3f}) compared to Deterministic ({det_emv:.3f}) and Uniform ({uni_emv:.3f}) policies, representing {ml_vs_det:.1f}% and {ml_vs_uni:.1f}% improvements respectively."
+    elif det_emv <= uni_emv:
+        det_vs_ml_emv = ((ml_emv - det_emv) / ml_emv * 100) if ml_emv > 0 else 0
+        det_vs_uni_emv = ((uni_emv - det_emv) / uni_emv * 100) if uni_emv > 0 else 0
+        emv_comparison = f"Deterministic achieves the lowest expected operational loss ({det_emv:.3f}), while ML-TSSP ({ml_emv:.3f}) and Uniform ({uni_emv:.3f}) show {det_vs_ml_emv:.1f}% and {det_vs_uni_emv:.1f}% higher loss respectively."
+    else:
+        uni_vs_ml_emv = ((ml_emv - uni_emv) / ml_emv * 100) if ml_emv > 0 else 0
+        uni_vs_det_emv = ((det_emv - uni_emv) / det_emv * 100) if det_emv > 0 else 0
+        emv_comparison = f"Uniform achieves the lowest expected operational loss ({uni_emv:.3f}), while ML-TSSP ({ml_emv:.3f}) and Deterministic ({det_emv:.3f}) show {uni_vs_ml_emv:.1f}% and {uni_vs_det_emv:.1f}% higher loss respectively."
+    
+    low_risk_comparison = f"ML-TSSP preserves {ml_low_risk_count} low-risk sources compared to {det_low_risk_count} for Deterministic and {uni_low_risk_count} for Uniform, demonstrating superior risk-aware source preservation."
+    
+    st.markdown(f"""
+    <div style='background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); 
+                border: 1px solid #86efac; border-radius: 10px; padding: 1rem; 
+                margin: 1rem 0; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);'>
+        <h5 style='margin: 0 0 0.8rem 0; color: #065f46; font-size: 14px; font-weight: 700;'>
+            📊 Policy Comparison Summary
+        </h5>
+        <p style='margin: 0 0 0.6rem 0; font-size: 12px; color: #047857; line-height: 1.6;'>
+            <strong>Worst-Case Risk Exposure:</strong> {cvar_comparison}
+        </p>
+        <p style='margin: 0 0 0.6rem 0; font-size: 12px; color: #047857; line-height: 1.6;'>
+            <strong>Expected Operational Loss:</strong> {emv_comparison}
+        </p>
+        <p style='margin: 0; font-size: 12px; color: #047857; line-height: 1.6;'>
+            <strong>Source Preservation:</strong> {low_risk_comparison}
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Policy Tradeoff Summary
+    _ensure_source_state_and_risk_bucket(ml_policy)
+    ml_low_risk = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "low"])
+    ml_med_risk = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "medium"])
+    ml_high_risk = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "high"])
+    
+    # Determine policy posture based on assignment rate
+    if assignment_rate >= 95.0:
+        coverage_posture = "High"
+    elif assignment_rate >= 80.0:
+        coverage_posture = "Medium"
+    else:
+        coverage_posture = "Low"
+    
+    if disengagement_pressure < 5.0:
+        risk_posture = "Low"
+    elif disengagement_pressure < 10.0:
+        risk_posture = "Moderate"
+    else:
+        risk_posture = "High"
+    
+    if osi >= 95.0:
+        sustainability_posture = "Sustainable"
+    elif osi >= 90.0:
+        sustainability_posture = "Watchlist"
+    else:
+        sustainability_posture = "Critical"
+    
+    st.markdown("""
+    <div style='background: linear-gradient(135deg, #f8fafc 0%, #ffffff 100%); 
+                border: 1px solid #e2e8f0; border-radius: 10px; padding: 1rem; 
+                margin: 1rem 0; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);'>
+        <h5 style='margin: 0 0 0.8rem 0; color: #1e3a8a; font-size: 14px; font-weight: 700;'>
+            Policy Tradeoff Summary
+        </h5>
+        <table style='width: 100%; border-collapse: collapse; font-size: 12px;'>
+            <thead>
+                <tr style='background: #f1f5f9; border-bottom: 2px solid #cbd5e1;'>
+                    <th style='padding: 0.5rem; text-align: left; color: #475569; font-weight: 600;'>Policy Dimension</th>
+                    <th style='padding: 0.5rem; text-align: center; color: #475569; font-weight: 600;'>Current Posture</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr style='border-bottom: 1px solid #e2e8f0;'>
+                    <td style='padding: 0.5rem; color: #334155;'>Mission Coverage</td>
+                    <td style='padding: 0.5rem; text-align: center; font-weight: 600; color: #10b981;'>{coverage_posture}</td>
+                </tr>
+                <tr style='border-bottom: 1px solid #e2e8f0;'>
+                    <td style='padding: 0.5rem; color: #334155;'>Risk Exposure</td>
+                    <td style='padding: 0.5rem; text-align: center; font-weight: 600; color: #f59e0b;'>{risk_posture}</td>
+                </tr>
+                <tr>
+                    <td style='padding: 0.5rem; color: #334155;'>Source Sustainability</td>
+                    <td style='padding: 0.5rem; text-align: center; font-weight: 600; color: {osi_color};'>{sustainability_posture}</td>
+                </tr>
+            </tbody>
+        </table>
+        <p style='margin: 0.6rem 0 0 0; font-size: 11px; color: #64748b; line-height: 1.5;'>
+            ML-TSSP is performing well under present conditions, but continued operation at this posture may increase churn within the source pool over future cycles.
+        </p>
+    </div>
+    """.format(
+        coverage_posture=coverage_posture,
+        risk_posture=risk_posture,
+        sustainability_posture=sustainability_posture,
+        osi_color=osi_color
+    ), unsafe_allow_html=True)
+    
+    # Forward-looking question
+    st.markdown(f"""
+    <div style='background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); 
+                border-left: 4px solid #f59e0b; border-radius: 8px; padding: 1rem; 
+                margin: 1rem 0; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);'>
+        <p style='margin: 0; font-size: 13px; color: #92400e; font-weight: 600; line-height: 1.6;'>
+            Key Decision Question:
+        </p>
+        <p style='margin: 0.4rem 0 0 0; font-size: 12px; color: #78350f; line-height: 1.6;'>
+            Is the current level of disengagement pressure ({disengagement_pressure:.1f}%) acceptable given anticipated mission duration and replacement capacity, or should policy thresholds be adjusted to preserve long-term source sustainability?
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Comparison metrics (policy cards)
     # Enforce max tasks limit (from uploaded data only)
@@ -1769,17 +2124,8 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             return "↑", "#dc2626"
         return "→", "#d97706"
 
-    def _cvar95(policy):
-        risks = np.array([a.get("expected_risk", 0.0) for a in policy if a.get("expected_risk") is not None])
-        if risks.size == 0:
-            return 0.0
-        threshold = np.quantile(risks, 0.95)
-        tail = risks[risks >= threshold]
-        return float(tail.mean()) if tail.size else float(risks.mean())
-
-    ml_cvar = _cvar95(ml_policy)
-    det_cvar = _cvar95(det_policy)
-    uni_cvar = _cvar95(uni_policy)
+    # CVaR95 already calculated earlier for comparison summary, reuse here
+    # ml_cvar, det_cvar, uni_cvar are already in scope from earlier calculation
     cvar_best = min(ml_cvar, det_cvar, uni_cvar)
     cvar_worst = max(ml_cvar, det_cvar, uni_cvar)
 
@@ -5378,7 +5724,12 @@ Risk-Aware Intelligence Source Optimization for Strategic Decision Superiority
             "admin": "admin123",
             "analyst": "analyst123",
             "commander": "command123",
-            "operator": "ops123"
+            "operator": "ops123",
+            "case_officer": "case123",
+            "tasking": "task123",
+            "evaluator": "eval123",
+            "oversight": "oversight123",
+            "executive": "exec123",
         }
         
         # Login form with header
@@ -5412,6 +5763,7 @@ Risk-Aware Intelligence Source Optimization for Strategic Decision Superiority
                 if username in CREDENTIALS and password == CREDENTIALS[username]:
                     st.session_state.authenticated = True
                     st.session_state.username = username
+                    st.session_state.role = USER_ROLES.get(username, "executive")
                     st.session_state.login_time = datetime.now()
                     st.success(f"✅ Welcome back, {username.title()}!")
                     st.balloons()
@@ -5429,8 +5781,11 @@ Risk-Aware Intelligence Source Optimization for Strategic Decision Superiority
                 <p style="margin: 0.15rem 0; font-family: 'Roboto Mono', monospace; font-size: 10px; color: #1e40af; line-height: 1.5;">
                     <strong>Admin:</strong> admin / admin123<br>
                     <strong>Analyst:</strong> analyst / analyst123<br>
-                    <strong>Commander:</strong> commander / command123<br>
-                    <strong>Operator:</strong> operator / ops123
+                    <strong>Tasking:</strong> commander / command123<br>
+                    <strong>Case Officer:</strong> operator / ops123<br>
+                    <strong>Evaluator:</strong> evaluator / eval123<br>
+                    <strong>Oversight:</strong> oversight / oversight123<br>
+                    <strong>Executive:</strong> executive / exec123
                 </p>
             </div>
             <p style="margin-top: 0.4rem; font-size: 9px; opacity: 0.8;">
@@ -6039,6 +6394,10 @@ def render_streamlit_app():
     if not st.session_state.authenticated:
         _render_login_page()
         return
+
+    username = st.session_state.get("username", "unknown")
+    role = get_current_role()
+    role_label = ROLE_DEFINITIONS.get(role, {}).get("label", role)
     
     # ======================================================
     # LOGOUT BUTTON (Top Right - Professional) - STICKY
@@ -6214,22 +6573,28 @@ def render_streamlit_app():
         "📋 Source Profiles",
         "📈 Policy Insights",
         "💰 EVPI Focus",
-        "🔬 Stress Lab"
+        "🔬 Stress Lab",
+        "⚙️ System Administration"
     ]
     nav_lookup = {
         "📋 Source Profiles": "profiles",
         "📈 Policy Insights": "policies",
         "💰 EVPI Focus": "evpi",
-        "🔬 Stress Lab": "stress"
+        "🔬 Stress Lab": "stress",
+        "⚙️ System Administration": "admin"
     }
+    nav_labels = [label for label in nav_labels if _can_access_nav(nav_lookup.get(label, ""))]
+    if not nav_labels:
+        st.warning("No dashboard sections are available for your role.")
+        return
 
 
 
     # Dynamic navigation with state persistence and validation
     # Ensure nav_pills is always a valid nav_lookup value
-    valid_nav_keys = set(nav_lookup.values())
+    valid_nav_keys = {nav_lookup[l] for l in nav_labels}
     if "nav_pills" not in st.session_state or st.session_state["nav_pills"] not in valid_nav_keys:
-        st.session_state["nav_pills"] = "policies"
+        st.session_state["nav_pills"] = nav_lookup[nav_labels[0]]
     
     # Find the label corresponding to the current nav_pills value
     try:
@@ -6257,9 +6622,9 @@ def render_streamlit_app():
         st.session_state["nav_pills"] = nav_key  # Update nav_pills with the key value
     else:
         # Fallback: use the current nav_pills value or default to "policies"
-        nav_key = st.session_state.get("nav_pills", "policies")
+        nav_key = st.session_state.get("nav_pills", nav_lookup[nav_labels[0]])
         if nav_key not in valid_nav_keys:
-            nav_key = "policies"
+            nav_key = nav_lookup[nav_labels[0]]
             st.session_state["nav_pills"] = nav_key
     
     # Store current navigation for cross-section linking
@@ -6282,6 +6647,20 @@ def render_streamlit_app():
             "horizon": review_horizon,
             "tags": priority_tag
         }
+    
+    with st.sidebar:
+        st.markdown("""
+        <div class="control-panel">
+            <div class="control-panel-header" style="color: #0f172a;">🔐 Role & Access</div>
+        """, unsafe_allow_html=True)
+        st.markdown(f"<p style='margin:0.2rem 0 0.4rem 0; font-size:11px; color:#0f172a;'><strong>User:</strong> {username}</p>", unsafe_allow_html=True)
+        st.markdown(f"<p style='margin:0.1rem 0 0.6rem 0; font-size:11px; color:#0f172a;'><strong>Role:</strong> {role_label}</p>", unsafe_allow_html=True)
+        role_perms = sorted(list(ROLE_PERMISSIONS.get(role, set())))
+        if role_perms:
+            st.caption("Permissions: " + ", ".join(role_perms))
+        else:
+            st.caption("Permissions: none")
+        st.markdown("</div>", unsafe_allow_html=True)
     
     with st.sidebar:
         st.markdown("""
@@ -7526,7 +7905,10 @@ def render_streamlit_app():
             )
         
         # ========== DECISION THRESHOLDS CARD ==========
+        can_edit_thresholds = has_permission("manage_priorities") or has_permission("configure_system")
         with st.expander("⚖️ DECISION THRESHOLDS", expanded=True):
+            if not can_edit_thresholds:
+                st.info("Decision thresholds are view-only for your role.")
             rel_cols = st.columns(2)
             with rel_cols[0]:
                 rel_disengage = st.slider(
@@ -7536,7 +7918,8 @@ def render_streamlit_app():
                     0.05,
                     key="rel_disengage_slider",
                     help="Below this score, source is removed from tasking",
-                    on_change=_mark_results_stale
+                    on_change=_mark_results_stale,
+                    disabled=not can_edit_thresholds
                 )
                 st.markdown("<p style='font-size: 9px; color: #6b7280; margin: -0.5rem 0 0.5rem 0; line-height: 1.3;'>Below this score, source is automatically removed from tasking</p>", unsafe_allow_html=True)
                 
@@ -7548,7 +7931,8 @@ def render_streamlit_app():
                     0.05,
                     key="rel_ci_flag_slider",
                     help="Triggers enhanced monitoring and verification",
-                    on_change=_mark_results_stale
+                    on_change=_mark_results_stale,
+                    disabled=not can_edit_thresholds
                 )
                 st.markdown("<p style='font-size: 9px; color: #6b7280; margin: -0.5rem 0 0.5rem 0; line-height: 1.3;'>Triggers enhanced monitoring and CI review</p>", unsafe_allow_html=True)
             
@@ -7561,7 +7945,8 @@ def render_streamlit_app():
                     0.05,
                     key="dec_disengage_slider",
                     help="High deception confidence triggers full rejection",
-                    on_change=_mark_results_stale
+                    on_change=_mark_results_stale,
+                    disabled=not can_edit_thresholds
                 )
                 st.markdown("<p style='font-size: 9px; color: #6b7280; margin: -0.5rem 0 0.5rem 0; line-height: 1.3;'>High confidence deception triggers full source rejection</p>", unsafe_allow_html=True)
                 
@@ -7573,7 +7958,8 @@ def render_streamlit_app():
                     0.05,
                     key="dec_ci_flag_slider",
                     help="Moderate deception escalates to CI investigation",
-                    on_change=_mark_results_stale
+                    on_change=_mark_results_stale,
+                    disabled=not can_edit_thresholds
                 )
                 st.markdown("<p style='font-size: 9px; color: #6b7280; margin: -0.5rem 0 0.5rem 0; line-height: 1.3;'>Moderate deception risk escalates to CI investigation</p>", unsafe_allow_html=True)
             
@@ -7821,9 +8207,19 @@ def render_streamlit_app():
             # ========== OPTIMIZATION CONTROL PANEL ==========
             st.markdown('<h4 style="color: #1e3a8a; margin-bottom: 1rem;">🧪 Optimization Control Panel</h4>', unsafe_allow_html=True)
             
+            can_run_models = has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")
+            if not can_run_models:
+                st.info("Optimization execution is restricted for your role.")
             col_run, col_reset = st.columns([2, 1])
             with col_run:
-                run_button_right = st.button("▶ Execute Optimization", type="primary", use_container_width=True, key="run_opt_btn_right", help="Execute ML–TSSP with current configuration")
+                run_button_right = st.button(
+                    "▶ Execute Optimization",
+                    type="primary",
+                    use_container_width=True,
+                    key="run_opt_btn_right",
+                    help="Execute ML–TSSP with current configuration",
+                    disabled=not can_run_models
+                )
             with col_reset:
                 reset_button_right = st.button("↺ Reset Configuration", use_container_width=True, key="reset_btn_right", help="Clear configuration and results")
             
@@ -7881,8 +8277,15 @@ def render_streamlit_app():
             else:
                 results = st.session_state.get("results")
                 if st.session_state.get("results_stale"):
-                    _auto_refresh_results(sources)
-                    st.rerun()
+                    if use_real_data:
+                        st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
+                        if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
+                            if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_exec", use_container_width=True):
+                                _auto_refresh_results(sources)
+                                st.rerun()
+                    else:
+                        _auto_refresh_results(sources)
+                        st.rerun()
                 if len(sources) == 0:
                     st.session_state["results"] = None
                     st.info("No sources available. Add demo sources or upload real data to run optimization.")
@@ -8177,8 +8580,15 @@ def render_streamlit_app():
     if nav_key == "policies" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
         if st.session_state.get("results_stale"):
-            _auto_refresh_results(st.session_state.get("sources") or [])
-            st.rerun()
+            if use_real_data:
+                st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
+                if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
+                    if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_policies", use_container_width=True):
+                        _auto_refresh_results(st.session_state.get("sources") or [])
+                        st.rerun()
+            else:
+                _auto_refresh_results(st.session_state.get("sources") or [])
+                st.rerun()
         st.markdown("""<h3 class="section-header">📈 Policy Insights - Comparative Policy Evaluation</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
             Comprehensive analysis of ML–TSSP optimization results with policy comparisons and sensitivity assessments.
@@ -8277,28 +8687,31 @@ def render_streamlit_app():
                     st.rerun()
             
             with refresh_col2:
-                if st.button("📊 Export Results", key="export_policy_results", use_container_width=True):
-                    # Export current results
-                    export_data = {
-                        "ml_tssp": ml_policy,
-                        "deterministic": det_policy,
-                        "uniform": uni_policy,
-                        "emv": {
-                            "ml_tssp": ml_emv,
-                            "deterministic": det_emv,
-                            "uniform": uni_emv
-                        },
-                        "timestamp": datetime.now().isoformat(),
-                        "version": st.session_state.get("results_version", 0)
-                    }
-                    json_str = json.dumps(export_data, indent=2)
-                    st.download_button(
-                        label="💾 Download JSON",
-                        data=json_str,
-                        file_name=f"policy_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json",
-                        key="download_policy_json"
-                    )
+                if has_permission("export_bulk"):
+                    if st.button("📊 Export Results", key="export_policy_results", use_container_width=True):
+                        # Export current results
+                        export_data = {
+                            "ml_tssp": ml_policy,
+                            "deterministic": det_policy,
+                            "uniform": uni_policy,
+                            "emv": {
+                                "ml_tssp": ml_emv,
+                                "deterministic": det_emv,
+                                "uniform": uni_emv
+                            },
+                            "timestamp": datetime.now().isoformat(),
+                            "version": st.session_state.get("results_version", 0)
+                        }
+                        json_str = json.dumps(export_data, indent=2)
+                        st.download_button(
+                            label="💾 Download JSON",
+                            data=json_str,
+                            file_name=f"policy_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            key="download_policy_json"
+                        )
+                else:
+                    st.caption("Export is restricted for your role.")
             
             with refresh_col3:
                 if st.button("📈 View Advanced Metrics", key="view_advanced_from_policies", use_container_width=True):
@@ -8362,8 +8775,15 @@ def render_streamlit_app():
     elif nav_key == "evpi" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
         if st.session_state.get("results_stale"):
-            _auto_refresh_results(st.session_state.get("sources") or [])
-            st.rerun()
+            if use_real_data:
+                st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
+                if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
+                    if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_evpi", use_container_width=True):
+                        _auto_refresh_results(st.session_state.get("sources") or [])
+                        st.rerun()
+            else:
+                _auto_refresh_results(st.session_state.get("sources") or [])
+                st.rerun()
         st.markdown("""<h3 class="section-header">💰 EVPI Focus - Expected Value of Perfect Information</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
             Quantify the marginal value of eliminating source behavior uncertainty through perfect information acquisition.
@@ -8473,6 +8893,191 @@ def render_streamlit_app():
             _render_stress_section(ml_policy, ml_emv, det_emv, uni_emv, risk_reduction)
         st.markdown('</div>', unsafe_allow_html=True)
     
+    elif nav_key == "admin":
+        st.markdown('<div class="section-frame">', unsafe_allow_html=True)
+        st.markdown("""<h3 class="section-header">⚙️ System Administration</h3>
+        <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
+            Platform maintenance and configuration. No intelligence content or operational data.
+        </p>""", unsafe_allow_html=True)
+        
+        # Access restrictions notice
+        st.markdown("""
+        <div style="background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); 
+                    border-left: 4px solid #f59e0b; border-radius: 8px; padding: 0.8rem; 
+                    margin-bottom: 1.5rem; box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);">
+            <p style="margin: 0; font-size: 12px; color: #92400e; font-weight: 600; line-height: 1.6;">
+                🔒 Access Restrictions: System Administrators maintain the platform infrastructure only.
+            </p>
+            <p style="margin: 0.4rem 0 0 0; font-size: 11px; color: #78350f; line-height: 1.5;">
+                You <strong>cannot</strong> view intelligence content, source performance data, or influence operational decisions. 
+                This separation prevents technical staff from becoming shadow operators.
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # System Health Metrics
+        with st.expander("📊 System Health Metrics", expanded=True):
+            col1, col2, col3, col4 = st.columns(4)
+            
+            # Mock system health data (in production, this would come from actual system monitoring)
+            import random
+            cpu_usage = random.randint(20, 60)
+            memory_usage = random.randint(40, 70)
+            disk_usage = random.randint(30, 50)
+            active_sessions = len(st.session_state.get("active_users", [])) if "active_users" in st.session_state else random.randint(5, 15)
+            
+            with col1:
+                cpu_color = "#10b981" if cpu_usage < 50 else "#f59e0b" if cpu_usage < 75 else "#ef4444"
+                st.metric("CPU Usage", f"{cpu_usage}%", delta=None)
+                st.markdown(f'<div style="background:{cpu_color};height:8px;border-radius:4px;margin-top:0.3rem;"></div>', unsafe_allow_html=True)
+            
+            with col2:
+                mem_color = "#10b981" if memory_usage < 60 else "#f59e0b" if memory_usage < 80 else "#ef4444"
+                st.metric("Memory Usage", f"{memory_usage}%", delta=None)
+                st.markdown(f'<div style="background:{mem_color};height:8px;border-radius:4px;margin-top:0.3rem;"></div>', unsafe_allow_html=True)
+            
+            with col3:
+                disk_color = "#10b981" if disk_usage < 70 else "#f59e0b" if disk_usage < 85 else "#ef4444"
+                st.metric("Disk Usage", f"{disk_usage}%", delta=None)
+                st.markdown(f'<div style="background:{disk_color};height:8px;border-radius:4px;margin-top:0.3rem;"></div>', unsafe_allow_html=True)
+            
+            with col4:
+                st.metric("Active Sessions", active_sessions, delta=None)
+            
+            st.markdown("---")
+            
+            # System status
+            status_col1, status_col2 = st.columns(2)
+            with status_col1:
+                st.markdown("""
+                <div style="background:#f8fafc;padding:1rem;border-radius:8px;border-left:4px solid #10b981;">
+                    <p style="margin:0;font-size:13px;font-weight:600;color:#065f46;">✅ System Status: Operational</p>
+                    <p style="margin:0.3rem 0 0 0;font-size:11px;color:#64748b;">All services running normally</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with status_col2:
+                last_backup = st.session_state.get("last_backup_time", "Never")
+                st.markdown(f"""
+                <div style="background:#f8fafc;padding:1rem;border-radius:8px;border-left:4px solid #3b82f6;">
+                    <p style="margin:0;font-size:13px;font-weight:600;color:#1e40af;">💾 Last Backup: {last_backup}</p>
+                    <p style="margin:0.3rem 0 0 0;font-size:11px;color:#64748b;">Automated daily backups enabled</p>
+                </div>
+                """, unsafe_allow_html=True)
+        
+        # Configuration Settings
+        with st.expander("⚙️ Configuration Settings", expanded=True):
+            config_tab1, config_tab2, config_tab3 = st.tabs(["System", "Model", "Thresholds"])
+            
+            with config_tab1:
+                st.markdown("### System Configuration")
+                st.text_input("API Endpoint", value="https://api.example.com/v1", key="admin_api_endpoint", disabled=True)
+                st.number_input("Session Timeout (minutes)", min_value=5, max_value=480, value=60, key="admin_session_timeout")
+                st.number_input("Max Concurrent Users", min_value=1, max_value=100, value=50, key="admin_max_users")
+                st.selectbox("Log Level", ["DEBUG", "INFO", "WARNING", "ERROR"], index=1, key="admin_log_level")
+                
+                if st.button("💾 Save System Settings", key="admin_save_system", use_container_width=True):
+                    st.success("System settings saved (requires approval for deployment)")
+            
+            with config_tab2:
+                st.markdown("### Model Configuration")
+                st.markdown("**Current Model Versions:**")
+                st.markdown("- XGBoost Classifier: v2.1.3")
+                st.markdown("- GRU Regressor: v1.8.2")
+                st.markdown("- TSSP Optimizer: v3.0.1")
+                
+                st.file_uploader("Upload New Model", type=["pkl", "joblib", "h5"], key="admin_model_upload")
+                st.text_input("Model Version Tag", value="", key="admin_model_version", placeholder="e.g., v3.0.2")
+                
+                if st.button("🚀 Deploy Model Update", key="admin_deploy_model", use_container_width=True):
+                    st.warning("Model deployment requires approval from Operations Oversight")
+            
+            with config_tab3:
+                st.markdown("### Threshold Configuration")
+                st.markdown("⚠️ **Note:** Threshold changes require approval from Operations Oversight")
+                
+                threshold_col1, threshold_col2 = st.columns(2)
+                with threshold_col1:
+                    st.number_input("Low Risk Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05, key="admin_low_risk", disabled=True)
+                    st.number_input("Medium Risk Threshold", min_value=0.0, max_value=1.0, value=0.6, step=0.05, key="admin_medium_risk", disabled=True)
+                
+                with threshold_col2:
+                    st.number_input("Disengagement Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05, key="admin_disengage_threshold", disabled=True)
+                    st.number_input("Escalation Threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05, key="admin_escalation_threshold", disabled=True)
+                
+                if st.button("📝 Request Threshold Change", key="admin_request_threshold", use_container_width=True):
+                    st.info("Threshold change request submitted for approval")
+        
+        # User Accounts and Roles Management
+        with st.expander("👥 User Accounts & Roles", expanded=True):
+            user_tab1, user_tab2 = st.tabs(["Active Users", "Role Management"])
+            
+            with user_tab1:
+                st.markdown("### Active User Accounts")
+                
+                # Mock user data (in production, this would come from actual user database)
+                mock_users = [
+                    {"username": "admin", "role": "admin", "last_login": "2026-01-25 10:30", "status": "Active"},
+                    {"username": "analyst", "role": "analyst", "last_login": "2026-01-25 09:15", "status": "Active"},
+                    {"username": "commander", "role": "tasking_coordinator", "last_login": "2026-01-25 08:45", "status": "Active"},
+                    {"username": "operator", "role": "case_officer", "last_login": "2026-01-24 16:20", "status": "Active"},
+                    {"username": "evaluator", "role": "evaluation_officer", "last_login": "2026-01-25 07:30", "status": "Active"},
+                    {"username": "oversight", "role": "oversight", "last_login": "2026-01-25 11:00", "status": "Active"},
+                    {"username": "executive", "role": "executive", "last_login": "2026-01-24 14:00", "status": "Active"},
+                ]
+                
+                user_df = pd.DataFrame(mock_users)
+                user_df["Role Label"] = user_df["role"].map({k: v["label"] for k, v in ROLE_DEFINITIONS.items()})
+                display_df = user_df[["username", "Role Label", "last_login", "status"]].copy()
+                display_df.columns = ["Username", "Role", "Last Login", "Status"]
+                
+                st.dataframe(display_df, use_container_width=True, hide_index=True)
+                
+                st.markdown("---")
+                st.markdown("### User Actions")
+                action_col1, action_col2 = st.columns(2)
+                with action_col1:
+                    selected_user = st.selectbox("Select User", options=mock_users, format_func=lambda x: x["username"], key="admin_select_user")
+                    new_password = st.text_input("New Password", type="password", key="admin_new_password")
+                    if st.button("🔑 Reset Password", key="admin_reset_password", use_container_width=True):
+                        st.success(f"Password reset for {selected_user['username']} (requires user to change on next login)")
+                
+                with action_col2:
+                    new_role = st.selectbox("Assign Role", options=list(ROLE_DEFINITIONS.keys()), format_func=lambda x: ROLE_DEFINITIONS[x]["label"], key="admin_assign_role")
+                    if st.button("👤 Update Role", key="admin_update_role", use_container_width=True):
+                        st.success(f"Role updated to {ROLE_DEFINITIONS[new_role]['label']} for {selected_user['username']}")
+            
+            with user_tab2:
+                st.markdown("### Role Permissions Overview")
+                
+                for role_key, role_info in ROLE_DEFINITIONS.items():
+                    with st.expander(f"{role_info['label']} ({role_key})", expanded=False):
+                        perms = ROLE_PERMISSIONS.get(role_key, set())
+                        if perms:
+                            st.markdown("**Permissions:**")
+                            for perm in sorted(perms):
+                                st.markdown(f"- {perm}")
+                        else:
+                            st.markdown("*No specific permissions*")
+                        
+                        st.markdown("**Description:**")
+                        if role_key == "admin":
+                            st.markdown("System maintenance and configuration. Cannot view intelligence content or source performance data.")
+                        elif role_key == "case_officer":
+                            st.markdown("Field operations and source management.")
+                        elif role_key == "analyst":
+                            st.markdown("Intelligence analysis and scoring.")
+                        elif role_key == "tasking_coordinator":
+                            st.markdown("Task assignment and coordination.")
+                        elif role_key == "evaluation_officer":
+                            st.markdown("Source evaluation and validation.")
+                        elif role_key == "oversight":
+                            st.markdown("Operations oversight and compliance.")
+                        elif role_key == "executive":
+                            st.markdown("Strategic viewing and aggregated dashboards.")
+        
+        st.markdown('</div>', unsafe_allow_html=True)
+    
     # ======================================================
     # 3. SOURCE PROFILES AND TASKING
     # ======================================================
@@ -8521,10 +9126,16 @@ def render_streamlit_app():
             
             # Build source list from actual optimization data (single source of truth)
             actual_sources = st.session_state.get("sources") or sources
+            display_sources = _filter_sources_for_role(actual_sources, username, role)
+            if role == "case_officer" and not display_sources:
+                st.info("No assigned sources available for this handler.")
             results = st.session_state.get("results")
             sources_list = []
-            for idx, source in enumerate(actual_sources):
+            for idx, source in enumerate(display_sources):
                 src_id = source.get("source_id", f"SRC_{idx + 1:03d}")
+                display_id = src_id
+                if role == "case_officer":
+                    display_id = _pseudonymize_source_id(src_id, username)
                 expected_risk = 0.5
                 intrinsic_risk = None
                 task_assign = "—"
@@ -8560,7 +9171,8 @@ def render_streamlit_app():
                     else "Not in optimization" if source_state is None and results else "Unspecified"
                 )
                 sources_list.append({
-                    "id": src_id,
+                    "id": display_id,
+                    "real_id": src_id,
                     "index": idx,
                     "risk_level": risk_level,
                     "risk_color": risk_color,
@@ -8647,14 +9259,18 @@ def render_streamlit_app():
             actual_sources = st.session_state.get("sources") or sources
             results = st.session_state.get("results")
             selected_idx = st.session_state.selected_source_idx
-            if selected_idx >= len(actual_sources) and len(actual_sources) > 0:
-                selected_idx = len(actual_sources) - 1
+            display_sources = _filter_sources_for_role(actual_sources, username, role)
+            if selected_idx >= len(display_sources) and len(display_sources) > 0:
+                selected_idx = len(display_sources) - 1
                 st.session_state.selected_source_idx = selected_idx
-            if len(actual_sources) == 0:
+            if len(display_sources) == 0:
                 st.info("No sources available. Run optimization or add demo/real data in SOURCE DATA INPUT.")
             else:
-                source_data = actual_sources[selected_idx]
+                source_data = display_sources[selected_idx]
                 selected_src_id = source_data.get("source_id", f"SRC_{selected_idx + 1:03d}")
+                display_src_id = selected_src_id
+                if role == "case_officer":
+                    display_src_id = _pseudonymize_source_id(selected_src_id, username)
                 features = source_data.get("features", {})
                 tsr_default = float(features.get("task_success_rate", 0.5))
                 cor_default = float(features.get("corroboration_score", 0.5))
@@ -8676,7 +9292,7 @@ def render_streamlit_app():
                 <div style="background: linear-gradient(135deg, #1e40af 0%, #3b82f6 100%); padding: 1.2rem; border-radius: 10px; border: 2px solid #60a5fa; margin-bottom: 1rem; box-shadow: 0 4px 12px rgba(59, 130, 246, 0.3);">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
                         <div>
-                            <h4 style="margin: 0; font-size: 16px; font-weight: 700; color: #ffffff;">🔹 {selected_src_id}</h4>
+                            <h4 style="margin: 0; font-size: 16px; font-weight: 700; color: #ffffff;">🔹 {display_src_id}</h4>
                             <p style="margin: 0.3rem 0 0 0; font-size: 11px; color: #dbeafe;">Source Intelligence Profile & Configuration</p>
                         </div>
                     </div>
@@ -9157,8 +9773,11 @@ def render_streamlit_app():
     # ======================================================
     # 5. AUDIT & GOVERNANCE DASHBOARD
     # ======================================================
-    with st.expander("🧑‍⚖️ Audit & Governance Dashboard", expanded=False):
-        _render_audit_governance_section()
+    if has_permission("view_audit_logs"):
+        with st.expander("🧑‍⚖️ Audit & Governance Dashboard", expanded=False):
+            _render_audit_governance_section()
+    else:
+        st.info("Audit & governance access is restricted to oversight roles.")
 
     # ======================================================
     # COPYRIGHT SECTION

@@ -23,15 +23,17 @@ ACTION_RISK_MULTIPLIER = {
 }
 
 
-def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
+def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any]:
     """
     Execute ML-TSSP optimization on provided sources.
+    Uses ML models (XGBoost + GRU) when available, falls back to formulas otherwise.
     
     Args:
         payload: Dictionary containing 'sources' list and 'seed' for RNG
+        ml_pipeline: Optional ML pipeline object with predict methods. If None or not loaded, uses formula fallback.
         
     Returns:
-        Dictionary with 'policies' and 'emv' results
+        Dictionary with 'policies' and 'emv' results, plus '_using_ml_models' flag
     """
     sources = payload.get("sources", [])
     seed = payload.get("seed", 42)
@@ -40,6 +42,16 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
     policies = {"ml_tssp": [], "deterministic": [], "uniform": []}
     # Deterministic and Uniform models are Stage 1-only baselines.
     # They do not use ML predictions or progress to Stage 2 (no adaptive optimization).
+    
+    # Check if ML pipeline is available and loaded
+    use_ml_models = (
+        ml_pipeline is not None 
+        and hasattr(ml_pipeline, 'models_loaded') 
+        and ml_pipeline.models_loaded
+    )
+    
+    # Track if ML models were successfully used (for at least one source)
+    ml_models_used = False
     
     for source in sources:
         features = source.get("features", {})
@@ -50,19 +62,61 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
         dec_score = features.get("deception_score", 0.3)
         ci = features.get("ci_flag", 0)
         
-        # Calculate ML reliability score
-        reliability = np.clip(
-            0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler
-            - 0.15 * dec_score - 0.10 * ci + 0.05 * rng.normal(0, 0.03),
-            0.0, 1.0
-        )
+        # Prepare features dict for ML pipeline
+        features_dict = {
+            "tsr": tsr,
+            "cor": cor,
+            "time": time,
+            "handler": handler,
+            "dec_score": dec_score,
+            "ci": ci
+        }
         
-        # Calculate deception score
-        deception = np.clip(
-            0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler)
-            + 0.10 * rng.beta(2, 5),
-            0.0, 1.0
-        )
+        # Try to use ML models, fallback to formulas if unavailable or fails
+        reliability = None
+        deception = None
+        behavior_probs_ml = None
+        ml_prediction_failed = False
+        
+        if use_ml_models:
+            try:
+                # Use GRU Regressor for reliability score
+                reliability = ml_pipeline.predict_reliability_score(features_dict)
+                
+                # Use GRU Regressor for deception score
+                deception = ml_pipeline.predict_deception_score(features_dict)
+                
+                # Use XGBoost Classifier for behavior probabilities
+                behavior_probs_lower = ml_pipeline.predict_behavior_probabilities(features_dict)
+                
+                # Convert to lowercase keys format expected by this function
+                behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
+                
+                # Mark that ML models were successfully used
+                ml_models_used = True
+                
+            except Exception:
+                # ML prediction failed, will use formula fallback
+                ml_prediction_failed = True
+                reliability = None
+                deception = None
+                behavior_probs_ml = None
+        
+        # Fallback to formula-based calculations if ML not available or failed
+        if reliability is None or deception is None:
+            # Formula-based reliability calculation (fallback)
+            reliability = np.clip(
+                0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler
+                - 0.15 * dec_score - 0.10 * ci + 0.05 * rng.normal(0, 0.03),
+                0.0, 1.0
+            )
+            
+            # Formula-based deception calculation (fallback)
+            deception = np.clip(
+                0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler)
+                + 0.10 * rng.beta(2, 5),
+                0.0, 1.0
+            )
         
         # Get recourse rules
         recourse = source.get("recourse_rules", {})
@@ -85,38 +139,52 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
             action = "task"
             task = rng.choice(TASK_ROSTER)
         
-        # Formula-based behavior probabilities
-        cooperative_prob = max(0.0, min(1.0, reliability * (1 - deception) * 1.2))
-        uncertain_prob = max(0.0, min(1.0, (1 - reliability) * 0.4))
-        coerced_prob = max(0.0, min(1.0, deception * 0.3))
-        deceptive_prob = max(0.0, min(1.0, deception * 0.5))
-
-        total = cooperative_prob + uncertain_prob + coerced_prob + deceptive_prob
-        if total > 0:
-            behavior_probs = {
-                "cooperative": cooperative_prob / total,
-                "uncertain": uncertain_prob / total,
-                "coerced": coerced_prob / total,
-                "deceptive": deceptive_prob / total
-            }
+        # Use ML behavior probabilities if available, otherwise use formula-based fallback
+        if behavior_probs_ml is not None:
+            # Use ML-predicted behavior probabilities (from XGBoost)
+            behavior_probs = behavior_probs_ml
         else:
-            behavior_probs = {
-                "cooperative": 0.25,
-                "uncertain": 0.25,
-                "coerced": 0.25,
-                "deceptive": 0.25
-            }
+            # Formula-based behavior probabilities (fallback)
+            cooperative_prob = max(0.0, min(1.0, reliability * (1 - deception) * 1.2))
+            uncertain_prob = max(0.0, min(1.0, (1 - reliability) * 0.4))
+            coerced_prob = max(0.0, min(1.0, deception * 0.3))
+            deceptive_prob = max(0.0, min(1.0, deception * 0.5))
 
-        # Calculate ML-TSSP expected risk from behavior probabilities
-        expected_risk = sum(
+            total = cooperative_prob + uncertain_prob + coerced_prob + deceptive_prob
+            if total > 0:
+                behavior_probs = {
+                    "cooperative": cooperative_prob / total,
+                    "uncertain": uncertain_prob / total,
+                    "coerced": coerced_prob / total,
+                    "deceptive": deceptive_prob / total
+                }
+            else:
+                behavior_probs = {
+                    "cooperative": 0.25,
+                    "uncertain": 0.25,
+                    "coerced": 0.25,
+                    "deceptive": 0.25
+                }
+
+        # Calculate intrinsic risk (before recourse/action adjustment)
+        intrinsic_risk = sum(
             float(prob) * BEHAVIOR_RISK_MAP.get(behavior, 0.5)
             for behavior, prob in behavior_probs.items()
         )
-        expected_risk = np.clip(
-            expected_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0),
-            0.0, 1.0
-        )
+        intrinsic_risk = float(np.clip(intrinsic_risk, 0.0, 1.0))
+        
+        # Calculate expected risk (post-recourse, adjusted by action)
+        expected_risk = intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
+        expected_risk = float(np.clip(expected_risk, 0.0, 1.0))
         score = reliability * (1 - deception) * (1 - expected_risk)
+        
+        # Determine risk bucket from intrinsic risk
+        if intrinsic_risk < 0.3:
+            risk_bucket = "low"
+        elif intrinsic_risk > 0.6:
+            risk_bucket = "high"
+        else:
+            risk_bucket = "medium"
         
         policy_item = {
             "source_id": source.get("source_id"),
@@ -125,6 +193,8 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
             "action": action,
             "task": task,
             "expected_risk": float(expected_risk),
+            "intrinsic_risk": float(intrinsic_risk),
+            "risk_bucket": risk_bucket,
             "score": float(score)
         }
         
@@ -132,7 +202,9 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
 
         # Deterministic: Stage 1 only, fixed moderate risk, no ML, no Stage 2
         det_item = policy_item.copy()
+        det_item["intrinsic_risk"] = 0.5  # Fixed moderate intrinsic risk for baseline
         det_item["expected_risk"] = 0.5
+        det_item["risk_bucket"] = "medium"  # Fixed medium risk bucket
         det_item["score"] = reliability * (1 - deception) * (1 - det_item["expected_risk"])
         policies["deterministic"].append(det_item)
 
@@ -145,7 +217,16 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
         else:
             uniform_risk = 0.5
         uni_item = policy_item.copy()
+        uni_item["intrinsic_risk"] = float(uniform_risk)  # Use uniform risk as intrinsic
         uni_item["expected_risk"] = float(uniform_risk)
+        # Determine risk bucket for uniform
+        if uniform_risk < 0.3:
+            uni_risk_bucket = "low"
+        elif uniform_risk > 0.6:
+            uni_risk_bucket = "high"
+        else:
+            uni_risk_bucket = "medium"
+        uni_item["risk_bucket"] = uni_risk_bucket
         uni_item["score"] = reliability * (1 - deception) * (1 - uni_item["expected_risk"])
         policies["uniform"].append(uni_item)
     
@@ -160,7 +241,9 @@ def run_optimization(payload: Dict[str, Any]) -> Dict[str, Any]:
             "ml_tssp": ml_emv,
             "deterministic": det_emv,
             "uniform": uni_emv
-        }
+        },
+        "_using_ml_models": ml_models_used,
+        "_using_fallback": not ml_models_used
     }
 
 

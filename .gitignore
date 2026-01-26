@@ -58,7 +58,7 @@ coverage.xml
 
 # Data, models, outputs
 
-models/
+## models/ directory is now tracked for cloud deployment
 output/
 data/
 *.csv
