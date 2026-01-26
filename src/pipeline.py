@@ -247,8 +247,8 @@ class MLTSSPPipeline:
     
     def prepare_tssp_inputs(
         self,
-        n_sources: int = 100,
-        n_tasks: int = 10
+        n_sources: int = 500,
+        n_tasks: int = 20
     ) -> Dict:
         """
         Prepare inputs for TSSP optimization model.
@@ -601,9 +601,9 @@ class MLTSSPPipeline:
     
     def run_full_pipeline(
         self,
-        n_sources: int = 15000,
-        opt_n_sources: int = 100,
-        opt_n_tasks: int = 10,
+        n_sources: int = 500,
+        opt_n_sources: int = 500,
+        opt_n_tasks: int = 20,
         train_ml: bool = True,
         solver_name: str = 'glpk'
     ) -> Dict:

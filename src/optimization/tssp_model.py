@@ -209,7 +209,7 @@ class TSSPModel:
         self.model = model
         return model
     
-    def solve(self, solver_name: str = 'glpk', verbose: bool = False) -> bool:
+    def solve(self, solver_name: str = 'glpk', verbose: bool = False, timelimit: int = 600) -> bool:
         """
         Solve the optimization model.
         
@@ -233,7 +233,15 @@ class TSSPModel:
             raise ValueError(f"Solver '{solver_name}' not available. "
                            f"Please install a solver (e.g., 'pip install glpk' or use 'cbc')")
         
-        results = solver.solve(self.model, tee=verbose)
+        # Add a time limit to prevent endless runs (default 600 seconds)
+        solver_options = {}
+        # Only CBC supports a time limit via 'seconds' option
+        if solver_name.lower() == 'cbc':
+            solver_options['seconds'] = timelimit
+            results = solver.solve(self.model, tee=verbose, options=solver_options)
+        else:
+            # For GLPK and others, do not set a time limit (unsupported)
+            results = solver.solve(self.model, tee=verbose)
         
         # Check solution status
         if (results.solver.status == SolverStatus.ok and

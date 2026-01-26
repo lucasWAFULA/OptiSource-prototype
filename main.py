@@ -18,20 +18,20 @@ def main():
     parser.add_argument(
         '--n-sources',
         type=int,
-        default=15000,
-        help='Number of sources in dataset (default: 15000)'
+        default=500,
+        help='Number of sources in dataset (default: 500)'
     )
     parser.add_argument(
         '--opt-sources',
         type=int,
-        default=100,
-        help='Number of sources for optimization (default: 100)'
+        default=500,
+        help='Number of sources for optimization (default: 500)'
     )
     parser.add_argument(
         '--opt-tasks',
         type=int,
-        default=10,
-        help='Number of tasks for optimization (default: 10)'
+        default=20,
+        help='Number of tasks for optimization (default: 20)'
     )
     parser.add_argument(
         '--solver',
