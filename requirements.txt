@@ -11,3 +11,4 @@ h5py
 shap
 fastapi
 uvicorn
+matplotlib
