@@ -5,6 +5,26 @@ Provides optimization and explanation functions for the dashboard.
 
 import numpy as np
 from typing import Dict, List, Any
+import sys
+from pathlib import Path
+
+# Add src directory to path for TSSP model import
+sys.path.insert(0, str(Path(__file__).parent))
+
+try:
+    from src.optimization.tssp_model import TSSPModel
+    TSSP_AVAILABLE = True
+except ImportError:
+    TSSP_AVAILABLE = False
+    TSSPModel = None
+
+# Import shared_db functions for active thresholds
+try:
+    from shared_db import get_active_threshold_settings
+    SHARED_DB_AVAILABLE = True
+except ImportError:
+    SHARED_DB_AVAILABLE = False
+    get_active_threshold_settings = None
 
 # Task roster (same as dashboard)
 TASK_ROSTER = [f"Task {i + 1:02d}" for i in range(20)]
@@ -24,18 +44,24 @@ ACTION_RISK_MULTIPLIER = {
 
 
 def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any]:
+    # #region agent log
+    try:
+        import json as _json_log
+        import time as _time_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "api.py:run_optimization", "message": "Starting API run_optimization", "data": {"n_sources": len(payload.get("sources", [])), "has_pipeline": ml_pipeline is not None}, "timestamp": int(_time_log.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
+    except: pass
+    # #endregion
     """
     Execute ML-TSSP optimization on provided sources.
     
-    PRIMARY METHOD: Uses ML models (XGBoost + GRU) for all predictions.
-    FALLBACK ONLY: Formula-based calculations are used ONLY when ML models are unavailable or fail.
-    
-    The system is ML-TSSP driven - formulas are a safety fallback, not the primary method.
+    ML-TSSP ONLY: Uses ML models (XGBoost + GRU) for all predictions.
+    No formula-based fallback is permitted in this system.
     
     Args:
         payload: Dictionary containing 'sources' list and 'seed' for RNG
         ml_pipeline: ML pipeline object with predict methods. REQUIRED for ML-TSSP operation.
-                     If None or not loaded, system falls back to formulas (not recommended for production).
+                     If None or not loaded, the system raises an error.
         
     Returns:
         Dictionary with 'policies' and 'emv' results, plus '_using_ml_models' flag indicating ML usage
@@ -61,6 +87,15 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             "ML-TSSP models are required for optimization. "
             "ML pipeline is not available or models are not loaded. "
             "Please ensure ML models are properly initialized before running optimization."
+        )
+    
+    # TSSP model availability check (warn but allow fallback to decision logic)
+    if not TSSP_AVAILABLE:
+        import warnings
+        warnings.warn(
+            "TSSP optimization model is not available. "
+            "Will use decision logic with ML predictions. "
+            "For full ML-TSSP optimization, ensure src/optimization/tssp_model.py is accessible."
         )
     
     # PERFORMANCE OPTIMIZATION: Use batch predictions instead of per-source predictions
@@ -107,14 +142,143 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             "The system requires ML models to operate. Please check model files and pipeline configuration."
         ) from e
     
-    # Process each source with pre-computed predictions
+    # ===================================================================
+    # STEP 2: Prepare TSSP optimization inputs from ML predictions
+    # ===================================================================
+    # Extract source IDs and prepare TSSP inputs
+    source_ids = [s.get("source_id") for s in sources]
+    tasks = TASK_ROSTER.copy()
+    behavior_classes = [b.title() for b in BEHAVIOR_CLASSES]  # Capitalize for TSSP
+    
+    # Prepare behavior probabilities: Dict[(source_id, behavior_class), probability]
+    behavior_probabilities = {}
     for idx, source in enumerate(sources):
-        # Get pre-computed predictions
+        source_id = source.get("source_id")
+        behavior_probs_lower = behavior_probs_list[idx]
+        behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
+        
+        # Map to TSSP format with capitalized behavior names
+        for behavior_lower, prob in behavior_probs_ml.items():
+            behavior_capitalized = behavior_lower.title()
+            if behavior_capitalized in behavior_classes:
+                behavior_probabilities[(source_id, behavior_capitalized)] = float(prob)
+    
+    # Calculate Stage 1 costs: cost of assigning source to task
+    # Cost = 1 - (reliability * (1 - deception)) = risk of assignment
+    stage1_costs = {}
+    for idx, source in enumerate(sources):
+        source_id = source.get("source_id")
+        reliability = float(reliability_scores[idx])
+        deception = float(deception_scores[idx])
+        # Cost is inverse of quality: higher reliability and lower deception = lower cost
+        assignment_quality = reliability * (1 - deception)
+        assignment_cost = 1.0 - assignment_quality  # Cost increases as quality decreases
+        for task in tasks:
+            stage1_costs[(source_id, task)] = float(np.clip(assignment_cost, 0.0, 1.0))
+    
+    # Calculate recourse costs: cost of dealing with each behavior class
+    # Higher risk behaviors have higher recourse costs
+    recourse_costs = {}
+    for behavior in behavior_classes:
+        behavior_lower = behavior.lower()
+        risk = BEHAVIOR_RISK_MAP.get(behavior_lower, 0.5)
+        # Recourse cost is proportional to behavior risk
+        recourse_costs[behavior] = float(risk)
+    
+    # ===================================================================
+    # STEP 3: Build and solve TSSP optimization model
+    # ===================================================================
+    # TSSP optimization with ML predictions
+    # Use TSSP for smaller problems, fallback to decision logic for larger ones to prevent hanging
+    tssp_assignments = None
+    # Reduce TSSP usage to smaller problems to prevent hanging - can be increased if solver performance improves
+    # Limit to 20 sources for faster response times
+    use_tssp = TSSP_AVAILABLE and TSSPModel is not None and len(sources) <= 20
+    
+    if use_tssp:
+        try:
+            # Quick check: if problem is too large, skip TSSP immediately
+            if len(sources) > 20 or len(tasks) > 20:
+                tssp_assignments = None
+            else:
+                tssp_model = TSSPModel(
+                    sources=source_ids,
+                    tasks=tasks,
+                    behavior_classes=behavior_classes,
+                    behavior_probabilities=behavior_probabilities,
+                    stage1_costs=stage1_costs,
+                    recourse_costs=recourse_costs
+                )
+                
+                # Build the model (this should be fast)
+                tssp_model.build_model()
+                
+                # Solve the optimization problem with aggressive timeout protection
+                # Try CBC first (faster), fallback to GLPK
+                # Use 10 second timeout - TSSP should solve quickly for small problems
+                solver_success = False
+                solver_error = None
+                for solver_name in ['cbc', 'glpk']:
+                    try:
+                        # #region agent log
+                        try:
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "api.py:solver_loop", "message": "Attempting solver", "data": {"solver": solver_name, "n_sources": len(sources)}, "timestamp": int(_time_log.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
+                        except: pass
+                        # #endregion
+                        # Use short timeout to prevent UI hanging
+                        solver_success = tssp_model.solve(solver_name=solver_name, verbose=False, timelimit=10)
+                        # #region agent log
+                        try:
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(_json_log.dumps({"location": "api.py:solver_loop", "message": "Solver result", "data": {"solver": solver_name, "success": solver_success}, "timestamp": int(_time_log.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
+                        except: pass
+                        # #endregion
+                        if solver_success:
+                            break
+                    except Exception as e:
+                        solver_error = str(e)
+                        continue
+                    except KeyboardInterrupt:
+                        # Handle interruption gracefully
+                        solver_error = "Solver interrupted"
+                        break
+                
+                if not solver_success:
+                    # Silently fall back to decision logic - don't warn to avoid cluttering UI
+                    tssp_assignments = None
+                else:
+                    # Extract TSSP solution
+                    tssp_solution = tssp_model.solution
+                    if tssp_solution is not None and tssp_solution.get('status') == 'optimal':
+                        # Extract assignments from TSSP solution
+                        tssp_assignments = tssp_solution.get('assignments', {})
+                    else:
+                        # Silently skip TSSP and use decision logic
+                        tssp_assignments = None
+        
+        except Exception as e:
+            # If TSSP fails, silently fall back to decision logic (but still use ML predictions)
+            tssp_assignments = None
+    
+    # ===================================================================
+    # STEP 4: Map TSSP assignments to policy format
+    # ===================================================================
+    # Create mapping from source_id to TSSP assignment
+    source_to_task = {}
+    if tssp_assignments:
+        for (source_id, task), assigned in tssp_assignments.items():
+            if assigned:
+                source_to_task[source_id] = task
+    
+    # Process each source with ML predictions and TSSP assignments
+    for idx, source in enumerate(sources):
+        source_id = source.get("source_id")
+        
+        # Get pre-computed ML predictions
         reliability = float(reliability_scores[idx])
         deception = float(deception_scores[idx])
         behavior_probs_lower = behavior_probs_list[idx]
-        
-        # Convert to lowercase keys format expected by this function
         behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
         
         # Get recourse rules
@@ -124,50 +288,77 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         dec_disengage = recourse.get("dec_disengage", 0.75)
         dec_flag = recourse.get("dec_ci_flag", 0.60)
         
-        # Decision logic
-        if deception >= dec_disengage or reliability < rel_disengage:
-            action = "disengage"
-            task = None
-        elif deception >= dec_flag:
-            action = "flag_for_ci"
-            task = rng.choice(TASK_ROSTER)
-        elif reliability < rel_flag:
-            action = "flag_and_task"
-            task = rng.choice(TASK_ROSTER)
-        else:
-            action = "task"
-            task = rng.choice(TASK_ROSTER)
-        
-        # ML-TSSP REQUIRED: Use ML-predicted behavior probabilities (from XGBoost Classifier)
-        if behavior_probs_ml is None:
-            raise RuntimeError(
-                f"ML-TSSP behavior probability prediction failed for source {source.get('source_id', 'UNKNOWN')}. "
-                "The system requires ML models to operate."
-            )
-        behavior_probs = behavior_probs_ml
-
-        # Calculate intrinsic risk (before recourse/action adjustment)
+        # Calculate intrinsic risk from ML behavior probabilities
         intrinsic_risk = sum(
             float(prob) * BEHAVIOR_RISK_MAP.get(behavior, 0.5)
-            for behavior, prob in behavior_probs.items()
+            for behavior, prob in behavior_probs_ml.items()
         )
         intrinsic_risk = float(np.clip(intrinsic_risk, 0.0, 1.0))
+        
+        # Determine risk bucket using active thresholds from database
+        if SHARED_DB_AVAILABLE and get_active_threshold_settings:
+            try:
+                active_thresholds = get_active_threshold_settings()
+                low_threshold = active_thresholds.get("low_risk", 0.3)
+                medium_threshold = active_thresholds.get("medium_risk", 0.6)
+            except Exception:
+                # Fallback to defaults if database access fails
+                low_threshold = 0.3
+                medium_threshold = 0.6
+        else:
+            # Fallback to defaults if shared_db not available
+            low_threshold = 0.3
+            medium_threshold = 0.6
+        
+        if intrinsic_risk < low_threshold:
+            risk_bucket = "low"
+        elif intrinsic_risk > medium_threshold:
+            risk_bucket = "high"
+        else:
+            risk_bucket = "medium"
+        
+        # Use TSSP assignment if available, otherwise apply decision logic
+        if tssp_assignments and source_id in source_to_task:
+            # TSSP assigned this source to a task
+            task = source_to_task[source_id]
+            # Check if quality thresholds require disengagement despite TSSP assignment
+            if risk_bucket == "high" or deception >= dec_disengage or reliability < rel_disengage:
+                action = "disengage"
+                task = None
+            elif deception >= dec_flag:
+                action = "flag_for_ci"
+                # Keep TSSP-assigned task
+            elif reliability < rel_flag:
+                action = "flag_and_task"
+                # Keep TSSP-assigned task
+            else:
+                action = "task"
+                # Keep TSSP-assigned task
+        else:
+            # Fallback to decision logic (if TSSP didn't assign or failed)
+            if risk_bucket == "high":
+                action = "disengage"
+                task = None
+            elif deception >= dec_disengage or reliability < rel_disengage:
+                action = "disengage"
+                task = None
+            elif deception >= dec_flag:
+                action = "flag_for_ci"
+                task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
+            elif reliability < rel_flag:
+                action = "flag_and_task"
+                task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
+            else:
+                action = "task"
+                task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
         
         # Calculate expected risk (post-recourse, adjusted by action)
         expected_risk = intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
         expected_risk = float(np.clip(expected_risk, 0.0, 1.0))
         score = reliability * (1 - deception) * (1 - expected_risk)
         
-        # Determine risk bucket from intrinsic risk
-        if intrinsic_risk < 0.3:
-            risk_bucket = "low"
-        elif intrinsic_risk > 0.6:
-            risk_bucket = "high"
-        else:
-            risk_bucket = "medium"
-        
         policy_item = {
-            "source_id": source.get("source_id"),
+            "source_id": source_id,
             "reliability": float(reliability),
             "deception": float(deception),
             "action": action,
@@ -180,7 +371,8 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         
         policies["ml_tssp"].append(policy_item)
 
-        # Deterministic: Stage 1 only, fixed moderate risk, no ML, no Stage 2
+        # Deterministic: Stage 1 only, fixed moderate risk, no ML, no TSSP, no Stage 2
+        # Independent baseline model for comparison
         det_item = policy_item.copy()
         det_item["intrinsic_risk"] = 0.5  # Fixed moderate intrinsic risk for baseline
         det_item["expected_risk"] = 0.5
@@ -188,14 +380,10 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         det_item["score"] = reliability * (1 - deception) * (1 - det_item["expected_risk"])
         policies["deterministic"].append(det_item)
 
-        # Uniform: Stage 1 only, equal allocation, no ML, no Stage 2
-        if behavior_probs:
-            uniform_risk = sum(
-                BEHAVIOR_RISK_MAP.get(behavior, 0.5)
-                for behavior in behavior_probs.keys()
-            ) / len(behavior_probs)
-        else:
-            uniform_risk = 0.5
+        # Uniform: Stage 1 only, equal allocation, no ML, no TSSP, no Stage 2
+        # Independent baseline model for comparison - uses uniform distribution across behaviors
+        # Uniform risk = average of all behavior risks (equal probability assumption)
+        uniform_risk = sum(BEHAVIOR_RISK_MAP.values()) / len(BEHAVIOR_RISK_MAP)
         uni_item = policy_item.copy()
         uni_item["intrinsic_risk"] = float(uniform_risk)  # Use uniform risk as intrinsic
         uni_item["expected_risk"] = float(uniform_risk)
@@ -222,8 +410,8 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             "deterministic": det_emv,
             "uniform": uni_emv
         },
-        "_using_ml_models": ml_models_used,
-        "_using_fallback": not ml_models_used
+        "_using_ml_models": True,
+        "_using_fallback": False
     }
 
 

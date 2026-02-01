@@ -219,12 +219,17 @@ class TSSPModel:
             Name of the solver to use (default: 'glpk')
         verbose : bool
             Whether to print solver output
+        timelimit : int
+            Maximum time in seconds for solver (default: 600)
         
         Returns:
         --------
         bool
             True if solution is optimal, False otherwise
         """
+        import signal
+        import threading
+        
         if self.model is None:
             self.build_model()
         
@@ -235,17 +240,55 @@ class TSSPModel:
         
         # Add a time limit to prevent endless runs (default 600 seconds)
         solver_options = {}
-        # Only CBC supports a time limit via 'seconds' option
         if solver_name.lower() == 'cbc':
+            # CBC supports 'seconds'
             solver_options['seconds'] = timelimit
-            results = solver.solve(self.model, tee=verbose, options=solver_options)
-        else:
-            # For GLPK and others, do not set a time limit (unsupported)
-            results = solver.solve(self.model, tee=verbose)
+        elif solver_name.lower() == 'glpk':
+            # GLPK supports 'tmlim' (time limit in seconds)
+            solver_options['tmlim'] = timelimit
+        
+        # Use a thread-based timeout as a safety net for all platforms
+        results = [None]
+        exception = [None]
+        
+        def solve_with_timeout():
+            try:
+                # Try with solver options first
+                results[0] = solver.solve(self.model, tee=verbose, options=solver_options)
+            except Exception as e:
+                # If solver fails with options, try without BUT still use Python timeout
+                try:
+                    results[0] = solver.solve(self.model, tee=verbose)
+                except Exception as inner_e:
+                    exception[0] = RuntimeError(f"Solver execution failed: {str(inner_e)}")
+        
+        # Run solver in a thread with timeout
+        solver_thread = threading.Thread(target=solve_with_timeout, daemon=True)
+        solver_thread.start()
+        solver_thread.join(timeout=timelimit + 5)  # Add 5s buffer for overhead
+        
+        if solver_thread.is_alive():
+            # Solver exceeded timeout - return failure
+            self.solution = {
+                'status': 'timeout',
+                'message': f"Solver exceeded {timelimit}s timeout"
+            }
+            return False
+        
+        if exception[0] is not None:
+            raise exception[0]
+        
+        if results[0] is None:
+            self.solution = {
+                'status': 'failed',
+                'message': "Solver returned no results"
+            }
+            return False
         
         # Check solution status
-        if (results.solver.status == SolverStatus.ok and
-            results.solver.termination_condition == PyomoTerminationCondition.optimal):
+        solver_results = results[0]
+        if (solver_results.solver.status == SolverStatus.ok and
+            solver_results.solver.termination_condition == PyomoTerminationCondition.optimal):
             self.solution = {
                 'status': 'optimal',
                 'objective_value': value(self.model.Obj),
@@ -271,8 +314,8 @@ class TSSPModel:
         else:
             self.solution = {
                 'status': 'failed',
-                'message': f"Solver status: {results.solver.status}, "
-                          f"Termination: {results.solver.termination_condition}"
+                'message': f"Solver status: {solver_results.solver.status}, "
+                          f"Termination: {solver_results.solver.termination_condition}"
             }
             return False
     

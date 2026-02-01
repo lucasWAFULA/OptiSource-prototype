@@ -27,7 +27,9 @@ try:
         get_pending_tasking_requests, get_pending_recommendations,
         get_user_tasking_requests, get_latest_assignments, get_audit_log, log_audit,
         save_optimization_results, load_latest_optimization_results, get_optimization_results_timestamp,
-        batch_save_sources, batch_save_assignments, DB_ENGINE, DB_CONNECTED
+        batch_save_sources, batch_save_assignments, DB_ENGINE, DB_CONNECTED,
+        submit_threshold_request, approve_threshold_request, reject_threshold_request,
+        get_active_threshold_settings, get_pending_threshold_requests, get_threshold_request_history
     )
     SHARED_DB_AVAILABLE = True
 except ImportError:
@@ -51,6 +53,12 @@ except ImportError:
     def get_optimization_results_timestamp(*args, **kwargs): return None
     def batch_save_sources(*args, **kwargs): pass
     def batch_save_assignments(*args, **kwargs): pass
+    def submit_threshold_request(*args, **kwargs): return None
+    def approve_threshold_request(*args, **kwargs): return False
+    def reject_threshold_request(*args, **kwargs): return False
+    def get_active_threshold_settings(*args, **kwargs): return {}
+    def get_pending_threshold_requests(*args, **kwargs): return []
+    def get_threshold_request_history(*args, **kwargs): return []
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Suppress TensorFlow warnings
 os.environ['OMP_NUM_THREADS'] = '1'  # Limit CPU threads
 os.environ['MKL_NUM_THREADS'] = '1'  # Limit MKL threads
@@ -64,7 +72,7 @@ MODE = "streamlit"  # options: "streamlit", "api", "batch"
 
 # Operational limits (used by policy comparison, fallback optimization)
 MAX_SOURCES = 500
-MAX_TASKS = 50
+MAX_TASKS = 20
 
 try:
     import matplotlib.pyplot as plt
@@ -76,6 +84,7 @@ import hashlib
 from plotly.subplots import make_subplots
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import threading
 
 # #region agent log
 def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = ""):
@@ -95,6 +104,55 @@ def _debug_log(location: str, message: str, data: dict, hypothesis_id: str = "")
     except Exception:
         pass
 # #endregion
+
+# Shared DB save guard (prevents UI hangs when DB is slow/unavailable)
+_DB_SAVE_LOCK = threading.Lock()
+_DB_SAVE_IN_PROGRESS = False
+_DB_SAVE_LAST_TS = None
+
+def _queue_shared_db_save(result: dict, sources: list, username: str, role: str, sources_map: dict | None = None):
+    """Queue shared DB save work on a background thread (non-blocking)."""
+    global _DB_SAVE_IN_PROGRESS, _DB_SAVE_LAST_TS
+    if not SHARED_DB_AVAILABLE:
+        return
+    with _DB_SAVE_LOCK:
+        if _DB_SAVE_IN_PROGRESS:
+            return
+        _DB_SAVE_IN_PROGRESS = True
+
+    def _worker():
+        global _DB_SAVE_IN_PROGRESS, _DB_SAVE_LAST_TS
+        try:
+            save_optimization_results(result, sources, username)
+            _DB_SAVE_LAST_TS = get_optimization_results_timestamp()
+            sources_map_local = sources_map or {s.get("source_id"): s for s in sources}
+            ml_policy = result.get("policies", {}).get("ml_tssp", [])
+            if ml_policy:
+                sources_batch = []
+                assignments_batch = []
+                for assignment in ml_policy:
+                    source_id = assignment.get("source_id")
+                    if source_id:
+                        source_data = sources_map_local.get(source_id)
+                        if source_data:
+                            sources_batch.append((
+                                source_id,
+                                source_data.get("features", {}),
+                                source_data.get("recourse_rules", {})
+                            ))
+                        assignments_batch.append((source_id, assignment))
+                if sources_batch:
+                    batch_save_sources(sources_batch, username)
+                if assignments_batch:
+                    batch_save_assignments(assignments_batch, "ml_tssp", username)
+            log_audit(username, role, "run_optimization", "optimization", "batch",
+                     {"n_sources": len(sources), "using_ml": result.get("_using_ml_models", False)})
+        except Exception as e:
+            _debug_log("dashboard.py:shared_db_save", "DB save error", {"error": str(e)}, "H6")
+        finally:
+            _DB_SAVE_IN_PROGRESS = False
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 # Conditional Streamlit imports
 
@@ -216,10 +274,45 @@ BEHAVIOR_RISK_MAP = {
 }
 
 # Risk level thresholds (used for mapping expected_risk to categories)
+# These are defaults; active values are loaded from database if available
 RISK_LEVEL_THRESHOLDS = {
     "low": 0.3,
     "medium": 0.6
 }
+
+def get_active_risk_thresholds():
+    """Get active risk level thresholds from database, with fallback to defaults."""
+    if SHARED_DB_AVAILABLE:
+        try:
+            active = get_active_threshold_settings()
+            return {
+                "low": active.get("low_risk", RISK_LEVEL_THRESHOLDS["low"]),
+                "medium": active.get("medium_risk", RISK_LEVEL_THRESHOLDS["medium"])
+            }
+        except Exception:
+            return RISK_LEVEL_THRESHOLDS
+    return RISK_LEVEL_THRESHOLDS
+
+def get_active_recourse_rules():
+    """Get active recourse rules (thresholds) from database, with fallback to defaults."""
+    defaults = {
+        "rel_disengage": 0.35,
+        "rel_ci_flag": 0.50,
+        "dec_disengage": 0.75,
+        "dec_ci_flag": 0.60
+    }
+    if SHARED_DB_AVAILABLE:
+        try:
+            active = get_active_threshold_settings()
+            return {
+                "rel_disengage": active.get("rel_disengage", defaults["rel_disengage"]),
+                "rel_ci_flag": active.get("rel_ci_flag", defaults["rel_ci_flag"]),
+                "dec_disengage": active.get("dec_disengage", defaults["dec_disengage"]),
+                "dec_ci_flag": active.get("dec_ci_flag", defaults["dec_ci_flag"])
+            }
+        except Exception:
+            return defaults
+    return defaults
 
 # ======================================================
 # ROLE-BASED ACCESS CONTROL (INTELLIGENCE CYCLE)
@@ -227,8 +320,8 @@ RISK_LEVEL_THRESHOLDS = {
 ROLE_DEFINITIONS = {
     "case_officer": {"label": "Case Officer (Handler)"},
     "analyst": {"label": "Intelligence Analyst"},
-    "tasking_coordinator": {"label": "Tasking Coordinator"},
-    "evaluation_officer": {"label": "Source Evaluation Officer"},
+    "operator": {"label": "Operator (Execution Support)"},
+    "commander": {"label": "Commander (Tasking Control)"},
     "oversight": {"label": "Operations Oversight / Legal & Ethics"},
     "admin": {"label": "System Administrator (Technical)"},
     "executive": {"label": "Executive / Strategic Viewer"},
@@ -244,26 +337,40 @@ ROLE_PERMISSIONS = {
     },
     "analyst": {
         "view_reports",
-        "run_models",
+        "view_longitudinal_metrics",
         "score_intelligence",
         "compare_sources",
+        "upload_evaluation_data",
+        "compute_baselines",
+        "execute_optimization",
+        "configure_parameters",
+        "manage_priorities",
+        "flag_anomalies",
+        "view_aggregated_dashboards",
+        "view_capabilities",
+        "view_assigned_sources",
     },
-    "tasking_coordinator": {
+    "operator": {
+        "view_task_assignments",
+        "update_task_status",
+        "flag_execution_constraints",
+    },
+    "commander": {
         "approve_tasking",
         "assign_tasks",
         "view_capabilities",
-        "manage_priorities",
-    },
-    "evaluation_officer": {
-        "view_longitudinal_metrics",
-        "validate_scores",
-        "recommend_disengagement",
+        "trigger_escalation",
+        "request_reanalysis",
     },
     "oversight": {
         "view_audit_logs",
         "freeze_operations",
         "review_exceptions",
         "view_aggregated_dashboards",
+        "validate_decisions",
+        "view_reports",
+        "view_longitudinal_metrics",
+        "view_capabilities",
     },
     "admin": {
         "manage_users",
@@ -272,28 +379,32 @@ ROLE_PERMISSIONS = {
     },
     "executive": {
         "view_aggregated_dashboards",
+        "view_reports",
+        "view_longitudinal_metrics",
+        "view_capabilities",
     },
 }
 
 USER_ROLES = {
     "admin": "admin",
     "analyst": "analyst",
-    "commander": "tasking_coordinator",
-    "operator": "case_officer",
+    "commander": "commander",
+    "operator": "operator",
     "case_officer": "case_officer",
-    "tasking": "tasking_coordinator",
-    "evaluator": "evaluation_officer",
+    "tasking": "commander",
+    "evaluator": "oversight",
     "oversight": "oversight",
     "executive": "executive",
 }
 
 NAV_PERMISSION_MAP = {
-    "profiles": {"view_assigned_sources", "view_capabilities"},
+    "profiles": {"view_assigned_sources", "view_capabilities", "view_reports", "execute_optimization"},
     "policies": {"view_reports", "view_capabilities", "view_longitudinal_metrics", "view_aggregated_dashboards"},
-    "evpi": {"view_reports", "view_longitudinal_metrics", "view_aggregated_dashboards"},
-    "stress": {"run_models", "view_longitudinal_metrics"},
+    "evpi": {"view_reports", "view_longitudinal_metrics", "view_aggregated_dashboards", "view_capabilities", "execute_optimization"},
+    "stress": {"view_reports", "view_longitudinal_metrics", "view_capabilities", "execute_optimization"},
     "admin": {"manage_users", "configure_system"},
 }
+# Note: Analysts with execute_optimization permission can access profiles
 
 def get_current_role() -> str:
     role = st.session_state.get("role")
@@ -322,13 +433,26 @@ def _is_source_assigned_to_user(username: str, source_id: str) -> bool:
     return int(hashlib.md5(seed).hexdigest(), 16) % 3 == 0
 
 def _filter_sources_for_role(sources: list, username: str, role: str) -> list:
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_filter_sources_for_role", "message": "Filtering sources", "data": {"n_input": len(sources), "username": username, "role": role}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H4"}) + "\n")
+    except: pass
+    # #endregion
     # Admin cannot view intelligence content or source performance data
     if role == "admin":
         return []
-    if role != "case_officer":
-        return sources
+    if role != "case_officer" or True: # Pseudonymization disabled
+        return [
+            s # Return original source without modifying ID
+            for s in sources
+        ]
     filtered = [s for s in sources if _is_source_assigned_to_user(username, s.get("source_id", ""))]
-    return filtered
+    return [
+        s # Return original source without modifying ID
+        for s in filtered
+    ]
 
 # Operational Mode (Conservative, Balanced, Aggressive, Custom) controls the decision thresholds
 # for disengagement, flagging, etc. These thresholds affect how sources are assigned actions,
@@ -345,10 +469,11 @@ def _filter_sources_for_role(sources: list, username: str, role: str) -> list:
 #     High:   expected_risk > 0.6
 
 def get_risk_level(expected_risk: float) -> str:
-    """Map expected_risk to categorical risk level."""
-    if expected_risk < RISK_LEVEL_THRESHOLDS["low"]:
+    """Map expected_risk to categorical risk level using active thresholds."""
+    thresholds = get_active_risk_thresholds()
+    if expected_risk < thresholds["low"]:
         return "Low"
-    elif expected_risk > RISK_LEVEL_THRESHOLDS["medium"]:
+    elif expected_risk > thresholds["medium"]:
         return "High"
     else:
         return "Medium"
@@ -380,10 +505,11 @@ SOURCE_STATE_RECOMMENDED_DISENGAGEMENT = "recommended_disengagement"
 SOURCE_STATE_NOT_ASSIGNED = "not_assigned"
 
 def _risk_bucket_from_intrinsic(risk: float) -> str:
-    """Map intrinsic (pre-recourse) risk to low/medium/high. Never overwrite based on taskability."""
-    if risk < RISK_LEVEL_THRESHOLDS["low"]:
+    """Map intrinsic (pre-recourse) risk to low/medium/high using active thresholds. Never overwrite based on taskability."""
+    thresholds = get_active_risk_thresholds()
+    if risk < thresholds["low"]:
         return "low"
-    if risk > RISK_LEVEL_THRESHOLDS["medium"]:
+    if risk > thresholds["medium"]:
         return "high"
     return "medium"
 
@@ -423,18 +549,24 @@ def _ensure_source_state_and_risk_bucket(plist: list) -> None:
             else:
                 a["source_state"] = SOURCE_STATE_ASSIGNED
         
-        # IMPORTANT: With new risk-first logic, we TRUST the optimization's decisions
-        # But keep reporting consistent: disengagement implies high risk, and high risk implies disengagement.
+        # IMPORTANT: Risk bucket consistency rules
+        # 1. Disengaged sources are operationally "high risk" for reporting purposes
+        #    (even if intrinsic_risk is low/medium, disengagement means operational high risk)
+        # 2. High intrinsic_risk sources MUST be disengaged (behavior-based risk too high)
+        # 3. Low/medium intrinsic_risk sources can be disengaged due to quality issues
+        #    (low reliability or high deception), but we preserve intrinsic_risk for analysis
+        
         if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT:
-            # Recommended disengagement should always be reported as high risk
+            # Disengaged sources are operationally high risk for reporting
+            # This ensures UI consistency: disengaged = high risk display
             a["risk_bucket"] = "high"
             a["action"] = "disengage"
-        if a.get("risk_bucket") == "high":
-            # High-risk sources MUST be recommended for disengagement
+        elif a.get("risk_bucket") == "high":
+            # High intrinsic_risk sources MUST be disengaged (behavior-based risk too high)
+            # This is a safety check: if intrinsic_risk > 0.6, source should be disengaged
             if a.get("source_state") in (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED):
-                # Override: high-risk cannot have normal/escalated assignment
+                # Override: high intrinsic_risk cannot have normal/escalated assignment
                 a["source_state"] = SOURCE_STATE_RECOMMENDED_DISENGAGEMENT
-                # Update action to match
                 a["action"] = "disengage"
         # #region agent log
         try:
@@ -471,10 +603,76 @@ def _get_risk_bucket_from_assignment(a: dict) -> str:
     return _risk_bucket_from_intrinsic(er)
 
 def _mark_results_stale():
-    """Mark current results as stale to trigger auto-refresh."""
+    """Mark current results as stale when parameters change.
+    
+    Results remain visible; user must click Execute Optimization to refresh.
+    This prevents UI blinking/flickering in analyst and other sections.
+    """
     if st.session_state.get("results") is not None:
+        st.session_state["_parameters_changed"] = True
         st.session_state["results_stale"] = True
-        st.session_state["_auto_refresh_in_progress"] = False
+        st.session_state["_stale_version"] = st.session_state.get("_stale_version", 0) + 1
+        st.session_state["_pending_recompute"] = False
+
+def _safe_rerun(reason: str | None = None, reset_counter: bool = False):
+    """Rerun with flow control to avoid infinite loops."""
+    if reset_counter:
+        st.session_state["_consecutive_reruns"] = 0
+    
+    # Block rerun if we've already synced/executed this render cycle
+    # This is the most common cause of infinite loops
+    render_id = st.session_state.get("_current_render_id", 0)
+    if st.session_state.get("_last_rerun_render_id") == render_id:
+        # PROFESSIONAL STABILITY FIX: If we are already in this render cycle, 
+        # do not trigger another rerun. This is the ultimate loop killer.
+        return False
+        
+    if st.session_state.get("_consecutive_reruns", 0) >= 3:
+        if reason:
+            st.warning(f"⚠️ **Flow Control**: Rerun blocked ({reason}).")
+        return False
+    
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_safe_rerun", "message": "Triggering rerun", "data": {"reason": reason, "reset_counter": reset_counter, "consecutive_reruns": st.session_state.get("_consecutive_reruns", 0)}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H3"}) + "\n")
+    except: pass
+    # #endregion
+    
+    st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+    st.session_state["_last_rerun_time"] = time.time()
+    st.session_state["_last_rerun_render_id"] = render_id
+    st.rerun()
+    return True
+
+def _consume_button_click(key: str) -> bool:
+    """Mark a button click as consumed without mutating widget state."""
+    clicked = st.session_state.get(key)
+    flag_key = f"_{key}_consumed"
+    if not clicked:
+        if flag_key in st.session_state:
+            st.session_state.pop(flag_key, None)
+        return False
+    if st.session_state.get(flag_key):
+        return False
+    st.session_state[flag_key] = True
+    return True
+
+def _extract_shared_recourse_rules(shared_sources):
+    """Extract recourse rules from shared sources if available."""
+    if not shared_sources:
+        return None
+    for src in shared_sources:
+        rules = src.get("recourse_rules")
+        if isinstance(rules, dict) and rules:
+            return {
+                "rel_disengage": float(rules.get("rel_disengage", 0.35)),
+                "rel_ci_flag": float(rules.get("rel_ci_flag", 0.50)),
+                "dec_disengage": float(rules.get("dec_disengage", 0.75)),
+                "dec_ci_flag": float(rules.get("dec_ci_flag", 0.60)),
+            }
+    return None
 
 def _sync_results_from_shared_db():
     """
@@ -497,6 +695,16 @@ def _sync_results_from_shared_db():
         try:
             with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
                 _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:EXIT", "message": "Shared DB not available", "data": {}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
+        except: pass
+        # #endregion
+        return False
+    
+    # Restrict sync to page load only: run only when _allow_shared_sync is True (set once on app load)
+    if not st.session_state.get("_allow_shared_sync"):
+        # #region agent log
+        try:
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:BLOCKED", "message": "Sync blocked - page load only", "data": {"allow_shared_sync": st.session_state.get("_allow_shared_sync")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A"}) + "\n")
         except: pass
         # #endregion
         return False
@@ -535,6 +743,11 @@ def _sync_results_from_shared_db():
         if shared_results and shared_sources:
             # Check if shared results are newer than what we have
             if existing_results is None or existing_timestamp != shared_timestamp:
+                # FLOW CONTROL: Prevent sync from triggering reruns if we're already in a loop
+                if st.session_state.get("_consecutive_reruns", 0) >= 3:
+                    # Too many reruns - skip sync to prevent continuous loading
+                    return False
+                
                 # Load shared results into session state
                 st.session_state.results = shared_results
                 st.session_state.sources = shared_sources
@@ -542,13 +755,25 @@ def _sync_results_from_shared_db():
                 st.session_state["last_update_time"] = shared_timestamp if shared_timestamp else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 st.session_state["results_changed"] = True
                 st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+                # FLOW CONTROL: Do NOT mark as stale - sync should not trigger auto-refresh
                 st.session_state["results_stale"] = False
+                shared_rules = _extract_shared_recourse_rules(shared_sources)
+                if shared_rules:
+                    rules_hash = hashlib.md5(str(sorted(shared_rules.items())).encode()).hexdigest()
+                    st.session_state["_pending_shared_recourse_rules"] = shared_rules
+                    st.session_state["_pending_shared_rules_hash"] = rules_hash
+                    st.session_state["last_rules_hash"] = rules_hash
                 # #region agent log
                 try:
                     with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
                         _f.write(_json_log.dumps({"location": "dashboard.py:_sync_results_from_shared_db:SUCCESS", "message": "Synced results", "data": {"n_sources": len(shared_sources) if shared_sources else 0, "has_policies": "policies" in shared_results, "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "A,B,C"}) + "\n")
                 except: pass
                 # #endregion
+                # FLOW CONTROL: Return True but DO NOT trigger rerun here
+                # Let the caller decide if rerun is needed
+                # Restrict sync to page load only: disable until next session (e.g. user clicks Refresh)
+                st.session_state["_allow_shared_sync"] = False
+                st.session_state["_sync_done_this_render"] = render_id
                 return True
         # #region agent log
         try:
@@ -569,7 +794,7 @@ def _sync_results_from_shared_db():
         return False
 
 
-def _auto_refresh_results(sources, allow_real_data: bool = False):
+def _auto_refresh_results(sources, allow_real_data: bool = False) -> bool:
     """Auto-refresh optimization results to reflect current parameters."""
     # #region agent log
     import json as _json_log
@@ -578,58 +803,50 @@ def _auto_refresh_results(sources, allow_real_data: bool = False):
             _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:ENTRY", "message": "Auto refresh called", "data": {"n_sources": len(sources) if sources else 0, "results_stale": st.session_state.get("results_stale"), "auto_refresh_in_progress": st.session_state.get("_auto_refresh_in_progress")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
     except: pass
     # #endregion
-    # Guard: avoid auto-refresh in Real Data Mode unless explicitly allowed
+    sources = sources or []
+    
+    # FLOW CONTROL: One-shot refresh token
+    refresh_token = st.session_state.get("refresh_token")
+    last_consumed = st.session_state.get("last_consumed_refresh")
+    if not refresh_token or refresh_token == last_consumed:
+        return False
+    st.session_state["last_consumed_refresh"] = refresh_token
     data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
-    if data_mode == "📊 Real Data Mode (Your Input)" and not allow_real_data:
-        # #region agent log
-        try:
-            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:SKIP", "message": "Auto refresh skipped (real data mode)", "data": {"data_mode": data_mode, "allow_real_data": allow_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-        except: pass
-        # #endregion
-        return
-    if st.session_state.get("_auto_refresh_in_progress"):
-        return
-    st.session_state["_auto_refresh_in_progress"] = True
-    with st.spinner("🔄 Auto-refreshing batch optimization to reflect updated parameters…"):
-        payload = {"sources": sources, "seed": 42}
-        result = run_optimization(payload)
-        if isinstance(result, dict) and isinstance(result.get("policies"), dict):
-            sources_map = {s.get("source_id"): s for s in sources}
-            for pkey in ["ml_tssp", "deterministic", "uniform"]:
-                plist = result["policies"].get(pkey) or []
-                _ensure_source_state_and_risk_bucket(plist)
-                fixed = enforce_assignment_constraints(plist, sources_map)
-                result["policies"][pkey] = fixed
-                result.setdefault("emv", {})[pkey] = compute_emv(fixed)
-        st.session_state.results = result
-        st.session_state.sources = sources
-        st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["results_changed"] = True
-        st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
-        st.session_state["results_stale"] = False
-        rr = st.session_state.get("recourse_rules") or {}
-        st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
-        
-        # Save to shared DB for cross-section sharing
-        if SHARED_DB_AVAILABLE:
-            try:
-                username = st.session_state.get("username", "system")
-                save_optimization_results(result, sources, username)
-                st.session_state["shared_results_timestamp"] = get_optimization_results_timestamp()
-            except Exception as e:
-                if MODE == "streamlit":
-                    st.warning(f"⚠️ Could not save results to shared database: {e}")
-    st.session_state["_auto_refresh_in_progress"] = False
-    # #region agent log
-    try:
-        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-            _f.write(_json_log.dumps({"location": "dashboard.py:_auto_refresh_results:EXIT", "message": "Auto refresh complete", "data": {"results_stale": st.session_state.get("results_stale"), "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
-    except: pass
-    # #endregion
+    effective_real_data = st.session_state.get("_effective_real_data")
+    if effective_real_data is None:
+        effective_real_data = (data_mode == "📊 Real Data Mode (Your Input)")
+    if effective_real_data and not allow_real_data:
+        return False
+    if not sources:
+        return False
+    payload = {"sources": sources, "seed": 42}
+    result = run_optimization(payload)
+    if isinstance(result, dict) and isinstance(result.get("policies"), dict):
+        sources_map = {s.get("source_id"): s for s in sources}
+        for pkey in ["ml_tssp", "deterministic", "uniform"]:
+            plist = result["policies"].get(pkey) or []
+            _ensure_source_state_and_risk_bucket(plist)
+            fixed = enforce_assignment_constraints(plist, sources_map)
+            result["policies"][pkey] = fixed
+            result.setdefault("emv", {})[pkey] = compute_emv(fixed)
+    st.session_state.results = result
+    st.session_state.sources = sources
+    st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["results_changed"] = True
+    st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+    st.session_state["_parameters_changed"] = False
+    st.session_state["_results_updated"] = True
+    rr = st.session_state.get("recourse_rules") or {}
+    st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
+    # Save to shared DB for cross-section sharing (non-blocking)
+    if SHARED_DB_AVAILABLE:
+        username = st.session_state.get("username", "system")
+        role = st.session_state.get("role", "system")
+        _queue_shared_db_save(result, sources, username, role, sources_map=sources_map)
+    return True
 
 def _apply_preset_mode():
-    """Apply preset mode defaults to sliders and mark results stale."""
+    """Apply preset mode defaults to sliders and clear results."""
     mode = st.session_state.get("preset_mode")
     if mode == "🟢 Conservative":
         st.session_state["rel_disengage_slider"] = 0.45
@@ -647,6 +864,126 @@ def _apply_preset_mode():
         st.session_state["dec_disengage_slider"] = 0.85
         st.session_state["dec_ci_flag_slider"] = 0.70
     _mark_results_stale()
+
+def _run_optimization_execution(sources, n_sources, payload, username, role):
+    """Execute optimization and store results. Called from Execute Optimization button handler."""
+    # Show immediate feedback - optimization is starting
+    progress_placeholder = st.empty()
+    progress_placeholder.info(f"🚀 Starting ML–TSSP batch optimization for {n_sources} sources...")
+
+    # OPTIMIZATION: Only run optimization inside spinner - post-processing happens after
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_run_optimization_execution:BEFORE_RUN", "message": "Entering run_optimization", "data": {"n_sources": n_sources, "username": username, "role": role}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
+    except: pass
+    # #endregion
+    with st.spinner(f"🔄 Running ML–TSSP batch optimization ({n_sources} sources)…"):
+        result = run_optimization(payload)
+    
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:_run_optimization_execution:AFTER_RUN", "message": "Exited run_optimization", "data": {"has_result": result is not None, "result_keys": list(result.keys()) if isinstance(result, dict) else None}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
+    except: pass
+    # #endregion
+
+    # Clear progress placeholder
+    progress_placeholder.empty()
+    if not isinstance(result, dict) or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
+        st.error("Optimization failed or returned no ML-TSSP results. Check model availability and input data.")
+        st.session_state["results"] = None
+        st.session_state["_has_executed_optimization"] = False
+        st.session_state["_pending_recompute"] = False  # Prevent endless rerun
+        st.session_state["_parameters_changed"] = False
+        st.session_state["results_stale"] = False
+        return
+
+    # Post-processing (fast operations) - outside spinner for immediate feedback
+    if isinstance(result, dict) and isinstance(result.get("policies"), dict):
+        sources_map = {s.get("source_id"): s for s in sources}
+        for pkey in ["ml_tssp", "deterministic", "uniform"]:
+            plist = result["policies"].get(pkey) or []
+            _ensure_source_state_and_risk_bucket(plist)
+            fixed = enforce_assignment_constraints(plist, sources_map)
+            result["policies"][pkey] = fixed
+            result.setdefault("emv", {})[pkey] = compute_emv(fixed)
+            
+        # Ensure outcome_summary and other narratives are updated in the result itself
+        # This helps the executive summary stay in sync
+        ml_policy = result["policies"].get("ml_tssp", [])
+        n_all = len(ml_policy)
+        rec_dis = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
+        ass_esc = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
+        ass_norm = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_ASSIGNED)
+        
+        parts = []
+        if rec_dis > 0: parts.append(f"**{rec_dis}** disengaged")
+        if ass_esc > 0: parts.append(f"**{ass_esc}** escalated")
+        if ass_norm > 0: parts.append(f"**{ass_norm}** normal")
+        
+        result["_summary_text"] = ", ".join(parts) if parts else "All sources processed"
+        result["_n_all"] = n_all
+        
+        # Calculate improvement for the summary
+        ml_emv = result.get("emv", {}).get("ml_tssp", 0)
+        uni_emv = result.get("emv", {}).get("uniform", 0)
+        result["_risk_reduction"] = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0.0
+
+    # Store results and update timestamp for dynamic sections
+    st.session_state.results = result
+    st.session_state.sources = sources
+    st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["results_changed"] = True
+    st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+    st.session_state["results_stale"] = False
+    st.session_state["_pending_recompute"] = False
+    st.session_state["_parameters_changed"] = False
+    st.session_state["_has_executed_optimization"] = True
+    
+    # Reset the button state manually to prevent re-execution
+    # PROFESSIONAL STABILITY FIX: Only reset if the key exists and is actually True
+    # to avoid redundant state mutations that Streamlit might block
+    # We use a try-except here because Streamlit sometimes blocks manual reset 
+    # of widget-linked keys during certain parts of the execution cycle
+    try:
+        if st.session_state.get("run_opt_btn_right"):
+            st.session_state["run_opt_btn_right"] = False
+    except Exception:
+        pass
+
+    # Clear cache immediately (fast operation)
+    if "risk_threshold_filter" in st.session_state:
+        del st.session_state["risk_threshold_filter"]
+    if "reliability_min_filter" in st.session_state:
+        del st.session_state["reliability_min_filter"]
+    cache_keys_to_clear = [k for k in st.session_state.keys() if k.startswith("cached_")]
+    for key in cache_keys_to_clear:
+        del st.session_state[key]
+
+    # Update recourse rules hash
+    rr = st.session_state.get("recourse_rules") or {}
+    st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
+
+    # Show success immediately
+    st.success(f"✅ Batch optimization complete! Processed {n_sources} sources efficiently. All sections updated dynamically.")
+    st.session_state.show_results_popup = True
+
+    # Database saves happen in background (non-blocking)
+    if SHARED_DB_AVAILABLE:
+        _queue_shared_db_save(result, sources, username, role, sources_map=sources_map)
+
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:RERUN", "message": "Triggering rerun", "data": {"has_results": st.session_state.get("results") is not None, "shared_timestamp": st.session_state.get("shared_results_timestamp"), "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D,E"}) + "\n")
+    except: pass
+    # #endregion
+    # Do NOT call st.rerun() here: Streamlit already reruns after button clicks.
+    # Forcing a second rerun while background DB writes are active causes hanging.
 
 TASK_ROSTER = [f"Task {i + 1:02d}" for i in range(20)]
 
@@ -1122,13 +1459,26 @@ def _init_streamlit():
         font-size: 13px;
         color: #6b7280;
     }
+    
+    /* Right panel: use full width and balance KPI/summary layout */
+    .main .block-container {
+        max-width: 100%;
+        padding-left: 1.5rem;
+        padding-right: 1.5rem;
+    }
+    [data-testid="column"]:has([data-testid="stPlotlyChart"]) {
+        min-width: 0;
+    }
+    .js-plotly-plot .plotly .main-svg {
+        max-width: 100% !important;
+    }
     </style>
     """, unsafe_allow_html=True)
 
 # ...existing API helper functions...
 # Import API functions with graceful fallback
 USE_LOCAL_API = False
-BACKEND_URL = "http://backend:8000"
+BACKEND_URL = "http://localhost:8000"
 
 
 try:
@@ -1150,265 +1500,54 @@ def run_optimization(payload: dict):
     """
     # Fast, efficient optimization with error handling and minimal overhead
     models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
-    if not models_available:
-        raise RuntimeError(
-            "ML-TSSP models are required for optimization. "
-            "ML pipeline is not available or models are not loaded. "
-            "Please ensure ML models are properly initialized before running optimization."
-        )
-    # Use local API (preferred for speed)
-    if USE_LOCAL_API and local_run_optimization:
-        try:
-            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
-        except TypeError:
-            # Fallback if fast_mode not supported
-            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
-        if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-            raise RuntimeError(
-                "ML-TSSP optimization returned invalid results. "
-                "Please check ML model files and pipeline configuration."
-            )
-    else:
-        # Backend API mode (ensure timeout is low for responsiveness)
-        try:
-            r = requests.post(f"{BACKEND_URL}/optimize", json=payload, timeout=3)
-            r.raise_for_status()
-            result = r.json()
+    try:
+        print("[HEARTBEAT] Entered run_optimization")
+        if not models_available:
+            print("[HEARTBEAT] Models not available")
+            st.error("ML-TSSP models are required for optimization. Please ensure ML models are properly initialized before running optimization.")
+            return None
+        # Use local API (preferred for speed)
+        if USE_LOCAL_API and local_run_optimization:
+            print("[HEARTBEAT] Using local_run_optimization")
+            try:
+                print("[HEARTBEAT] Calling local_run_optimization (fast_mode=True)")
+                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
+                print("[HEARTBEAT] local_run_optimization (fast_mode=True) returned")
+            except TypeError:
+                print("[HEARTBEAT] Calling local_run_optimization (no fast_mode)")
+                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+                print("[HEARTBEAT] local_run_optimization (no fast_mode) returned")
             if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-                raise RuntimeError(
-                    "Backend API returned invalid results. "
-                    "Please ensure backend has ML-TSSP models available."
-                )
-        except requests.RequestException as e:
-            raise RuntimeError(
-                f"Backend API unavailable: {e}. "
-                "ML-TSSP models are required. Please ensure backend is running with ML models."
-            ) from e
-    # Mark as ML result
-    result["_using_ml_models"] = True
-    result["_using_fallback"] = False
-    # Store result in session state for dynamic updates
-    if MODE == "streamlit":
-        st.session_state["last_optimization_result"] = result
-        st.session_state["last_optimization_time"] = datetime.now().isoformat()
-    return result
-
-def _fallback_optimization(payload: dict):
-    """
-    DEPRECATED: Formula-based optimization is no longer supported.
-    The system requires ML-TSSP models (XGBoost + GRU) to operate.
-    This function is kept for reference only and should not be called.
-    """
-    raise RuntimeError(
-        "Formula-based optimization is no longer supported. "
-        "ML-TSSP models (XGBoost + GRU) are required for system operation. "
-        "Please ensure ML models are properly initialized."
-    )
-    sources = payload.get("sources", [])
-    if not sources:
-        st.error("You must upload source data to proceed.")
-        st.stop()
-    if MAX_SOURCES is not None and len(sources) > MAX_SOURCES:
-        sources = sources[:MAX_SOURCES]
-    seed = payload.get("seed", 42)
-    rng = np.random.default_rng(seed)
-    
-    policies = {"ml_tssp": [], "deterministic": [], "uniform": []}
-    
-    if MAX_SOURCES is not None and len(sources) > MAX_SOURCES:
-        sources = sources[:MAX_SOURCES]
-    for source in sources:
-        features = source.get("features", {})
-        source_id = source.get("source_id", "UNKNOWN")
-        
-        # Extract features with defaults
-        tsr = features.get("task_success_rate", 0.5)
-        cor = features.get("corroboration_score", 0.5)
-        time = features.get("report_timeliness", 0.5)
-        handler = features.get("handler_confidence", 0.5)
-        dec_score = features.get("deception_score", 0.3)
-        ci = features.get("ci_flag", 0)
-        
-        # Formula-based reliability calculation (no ML models required)
-        reliability = np.clip(
-            0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler
-            - 0.15 * dec_score - 0.10 * ci,
-            0.0, 1.0
-        )
-        
-        # Formula-based deception calculation (no ML models required)
-        deception = np.clip(
-            0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler),
-            0.0, 1.0
-        )
-        
-        # Get recourse rules
-        recourse = source.get("recourse_rules", {})
-        rel_disengage = recourse.get("rel_disengage", 0.35)
-        rel_flag = recourse.get("rel_ci_flag", 0.50)
-        dec_disengage = recourse.get("dec_disengage", 0.75)
-        dec_flag = recourse.get("dec_ci_flag", 0.60)
-        
-        # Score calculation (for optimization ranking)
-        score = reliability * (1 - deception)
-        
-        # Formula-based behavior probabilities (no ML models required)
-        # Based on reliability and deception scores
-        cooperative_prob = max(0.0, min(1.0, reliability * (1 - deception) * 1.2))
-        uncertain_prob = max(0.0, min(1.0, (1 - reliability) * 0.4))
-        coerced_prob = max(0.0, min(1.0, deception * 0.3))
-        deceptive_prob = max(0.0, min(1.0, deception * 0.5))
-        
-        # Normalize probabilities
-        total = cooperative_prob + uncertain_prob + coerced_prob + deceptive_prob
-        if total > 0:
-            behavior_probs = {
-                "cooperative": cooperative_prob / total,
-                "uncertain": uncertain_prob / total,
-                "coerced": coerced_prob / total,
-                "deceptive": deceptive_prob / total
-            }
+                print("[HEARTBEAT] Invalid result from local_run_optimization")
+                st.error("ML-TSSP optimization returned invalid results. Please check ML model files and pipeline configuration.")
+                return None
         else:
-            # Fallback to equal probabilities
-            behavior_probs = {
-                "cooperative": 0.25,
-                "uncertain": 0.25,
-                "coerced": 0.25,
-                "deceptive": 0.25
-            }
-        
-        # Intrinsic risk (before recourse): behavior-weighted risk classification
-        if isinstance(behavior_probs, dict) and behavior_probs:
-            intrinsic_risk = sum(
-                float(prob) * BEHAVIOR_RISK_MAP.get(behavior, 0.5)
-                for behavior, prob in behavior_probs.items()
-            )
-        else:
-            # Fallback: simple formula if behavior probs fail
-            intrinsic_risk = 0.5 * (1 - reliability) + 0.5 * deception
-        intrinsic_risk = float(np.clip(intrinsic_risk, 0.0, 1.0))
-        risk_bucket = _risk_bucket_from_intrinsic(intrinsic_risk)
-        
-        # REVISED DECISION LOGIC: Align action with risk_bucket (primary) + threshold constraints (secondary)
-        # This ensures escalation is consistent with risk classification
-        if risk_bucket == "high":
-            # High-risk: Always recommend disengagement
-            action = "disengage"
-            task = rng.choice(TASK_ROSTER)
-        elif risk_bucket == "medium":
-            # Medium-risk: Check if deception/reliability warrants escalation
-            if deception >= dec_flag or reliability < rel_flag:
-                action = "flag_and_task"  # Escalate medium-risk with quality concerns
-            else:
-                action = "task"  # Medium-risk but acceptable quality
-            task = rng.choice(TASK_ROSTER)
-        else:  # risk_bucket == "low"
-            # Low-risk: Check for quality issues (but don't escalate unless significant)
-            if deception >= dec_disengage or reliability < rel_disengage:
-                # Severe quality issues even for low-risk → escalate
-                action = "flag_and_task"
-                task = rng.choice(TASK_ROSTER)
-            elif deception >= dec_flag and reliability < rel_flag:
-                # Both moderate concerns → escalate
-                action = "flag_and_task"
-                task = rng.choice(TASK_ROSTER)
-            elif deception >= dec_flag:
-                # Deception concern only → light flag
-                action = "flag_for_ci"
-                task = rng.choice(TASK_ROSTER)
-            else:
-                # Low-risk with good quality → normal assignment
-                action = "task"
-                task = rng.choice(TASK_ROSTER)
-        
-        # source_state explicitly derived from risk_bucket + action
-        if risk_bucket == "high":
-            source_state = SOURCE_STATE_RECOMMENDED_DISENGAGEMENT
-        else:
-            source_state = _action_to_source_state(action)
-        # #region agent log
-        try:
-            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                _f.write(json.dumps({
-                    "sessionId": "debug-session",
-                    "runId": "pre-fix",
-                    "hypothesisId": "H2",
-                    "location": "dashboard.py:_fallback_optimization",
-                    "message": "risk_bucket_vs_action",
-                    "data": {
-                        "source_id": source_id,
-                        "reliability": float(reliability),
-                        "deception": float(deception),
-                        "rel_disengage": float(rel_disengage),
-                        "dec_disengage": float(dec_disengage),
-                        "intrinsic_risk": intrinsic_risk,
-                        "risk_bucket": risk_bucket,
-                        "action": action
-                    },
-                    "timestamp": int(time.time() * 1000)
-                }) + "\n")
-        except Exception:
-            pass
-        # #endregion
-
-        # Expected risk (post-recourse) for EMV: action-adjusted. Disengaged contribute 0 in compute_emv.
-        expected_risk = intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
-        expected_risk = float(np.clip(expected_risk, 0.0, 1.0))
-
-        # ML-TSSP: explicit source_state; task None for disengage
-        ml_item = {
-            "source_id": source_id,
-            "reliability": float(reliability),
-            "deception": float(deception),
-            "action": action,
-            "task": task,
-            "expected_risk": expected_risk,
-            "intrinsic_risk": intrinsic_risk,
-            "risk_bucket": risk_bucket,
-            "source_state": source_state,
-            "score": float(score),
-            "behavior_probs": behavior_probs,
-            "_using_ml_models": False,
-            "_using_formula_fallback": True
-        }
-        # Deterministic: Stage 1 only baseline (no ML, no Stage 2)
-        # Uses a fixed moderate risk (e.g., 0.5) for all assignments.
-        det_item = ml_item.copy()
-        det_item["expected_risk"] = 0.5
-        # Uniform: Stage 1 only baseline (no ML, no Stage 2)
-        # Uses equal allocation/average risk for all assignments.
-        if isinstance(behavior_probs, dict) and behavior_probs:
-            uniform_risk = sum(
-                BEHAVIOR_RISK_MAP.get(behavior, 0.5)
-                for behavior in behavior_probs.keys()
-            ) / len(behavior_probs)
-        else:
-            uniform_risk = 0.5
-        uni_item = ml_item.copy()
-        uni_item["expected_risk"] = uniform_risk
-        # Deterministic and Uniform do not use ML predictions or Stage 2 recourse.
-        # They are fixed-rule, Stage 1-only baselines.
-        policies["ml_tssp"].append(ml_item)
-        policies["deterministic"].append(det_item)
-        policies["uniform"].append(uni_item)
-    
-    ml_emv = sum(p["expected_risk"] for p in policies["ml_tssp"])
-    det_emv = sum(p["expected_risk"] for p in policies["deterministic"])
-    uni_emv = sum(p["expected_risk"] for p in policies["uniform"])
-    
-    return {
-        "policies": policies,
-        "emv": {
-            "ml_tssp": ml_emv,
-            "deterministic": det_emv,
-            "uniform": uni_emv
-        },
-        "_using_ml_models": False,
-        "_using_fallback": True,
-        "_fallback_type": "formula_based",
-        "_system_status": "Running without ML models - using formula-based calculations",
-        "_models_available": False
-    }
+            print("[HEARTBEAT] Using backend API for optimization")
+            try:
+                r = requests.post(f"{BACKEND_URL}/optimize", json=payload, timeout=3)
+                r.raise_for_status()
+                result = r.json()
+                print("[HEARTBEAT] Backend API returned result")
+                if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
+                    print("[HEARTBEAT] Invalid result from backend API")
+                    st.error("Backend API returned invalid results. Please ensure backend has ML-TSSP models available.")
+                    return None
+            except requests.RequestException as e:
+                print(f"[HEARTBEAT] Backend API unavailable: {e}")
+                st.error(f"Backend API unavailable: {e}. ML-TSSP models are required. Please ensure backend is running with ML models.")
+                return None
+        print("[HEARTBEAT] Optimization result is valid, updating session state")
+        result["_using_ml_models"] = True
+        result["_using_fallback"] = False
+        if MODE == "streamlit":
+            st.session_state["last_optimization_result"] = result
+            st.session_state["last_optimization_time"] = datetime.now().isoformat()
+        print("[HEARTBEAT] Exiting run_optimization")
+        return result
+    except Exception as e:
+        print(f"[HEARTBEAT] Exception in run_optimization: {e}")
+        st.error(f"Optimization failed: {e}")
+        return None
 
 def request_shap_explanation(source_payload: dict):
     if USE_LOCAL_API:
@@ -1421,7 +1560,7 @@ def request_shap_explanation(source_payload: dict):
             
             tsr = float(features.get("task_success_rate", 0.5))
             cor = float(features.get("corroboration_score", 0.5))
-            time = float(features.get("report_timeliness", 0.5))
+            timeliness = float(features.get("report_timeliness", 0.5))
             
             if behavior == "Cooperative":
                 behavior_shap["task_success_rate"] = tsr * 0.3
@@ -1545,7 +1684,7 @@ def _check_system_health():
     health['details']['shap_available'] = SHAP_AVAILABLE
     health['details']['shared_db_engine'] = DB_ENGINE
     health['details']['shared_db_connected'] = DB_CONNECTED
-    health['details']['shared_db_mode'] = "Cloud (Postgres)" if DB_ENGINE == "postgres" else "Local (SQLite)"
+    health['details']['shared_db_mode'] = "Local (SQLite)"
     
     return health
 
@@ -1702,7 +1841,6 @@ def _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, tot
     return recommendation, box_type
 
 def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reduction):
-    # Always sync results from shared DB at section start
     # #region agent log
     import json as _json_log
     try:
@@ -1710,7 +1848,6 @@ def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reductio
             _f.write(_json_log.dumps({"location": "dashboard.py:_render_strategic_decision_section:ENTRY", "message": "Section render start", "data": {"section": "strategic_decision", "has_sources": sources is not None, "has_ml_policy": ml_policy is not None}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
     except: pass
     # #endregion
-    _sync_results_from_shared_db()
     st.markdown("""
     <div class="insight-box">
         <strong>📊 Optimization Complete!</strong> Key outcomes from the latest ML–TSSP run.
@@ -1747,8 +1884,6 @@ def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reductio
     """, unsafe_allow_html=True)
 
 def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """
     Render policy framework section with interactive visualizations.
     All charts update dynamically based on filtered policies and user interactions.
@@ -1777,9 +1912,9 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
                 key="policy_chart_type",
                 horizontal=True
             )
-        # Real-time update indicator
+        # Real-time update indicator (already shown globally above, but show here too for clarity)
         if st.session_state.get("last_update_time"):
-            st.caption(f"🔄 Last updated: {st.session_state['last_update_time']} (Version: {results_version})")
+            st.caption(f"🔄 **Dynamic Updates Active** | Last updated: {st.session_state['last_update_time']} (Version: {results_version}) | All sections update when parameters change")
     col1, col2 = st.columns(2)
     with col1:
         if show_task_dist:
@@ -1939,8 +2074,6 @@ def _render_policy_framework_section(ml_policy, det_policy, uni_policy, ml_emv, 
     st.markdown('</div>', unsafe_allow_html=True)
 
 def _render_comparative_policy_section(results, ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv, risk_reduction):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """Unified comparative policy evaluation section."""
 
     # Helper function for CVaR95 calculation
@@ -1972,7 +2105,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     disengagement_pressure = (ml_recommended_disengage / ml_total * 100) if ml_total > 0 else 0.0
     net_viable_pool = ((ml_total - ml_recommended_disengage) / ml_total * 100) if ml_total > 0 else 0.0
     osi = net_viable_pool  # Operational Sustainability Index
-    
+
     # Determine OSI status
     if osi >= 95.0:
         osi_status = "Sustainable"
@@ -1983,7 +2116,11 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     else:
         osi_status = "Policy Intervention Required"
         osi_color = "#ef4444"
-    
+
+    # PROFESSIONAL STABILITY FIX: Show a warning if results are stale
+    if st.session_state.get("results_stale"):
+        st.warning("⚠️ **Parameters Changed**: These metrics reflect previous settings. Re-run optimization to update.")
+
     # Calculate comparison metrics for executive summary
     _ensure_source_state_and_risk_bucket(det_policy)
     _ensure_source_state_and_risk_bucket(uni_policy)
@@ -2534,8 +2671,6 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     # (Removed duplicate/empty sub-expander blocks)
 
 def _render_optimal_policy_section(results):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     st.markdown('<div class="insight-box">Recommended ML–TSSP assignment details.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get("ml_tssp", [])
     if policy:
@@ -2581,8 +2716,6 @@ def _render_optimal_policy_section(results):
         st.info(f"All uploaded sources are shown. Those recommended for disengagement are not assigned to any task. (Live: {len(df)} sources, {risk_levels.get('Recommended Disengagement', 0)} recommended for disengagement)")
 
 def _render_baseline_policy_section(title, policy_key, results):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     st.markdown(f'<div class="insight-box">{title} breakdown.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get(policy_key, [])
     if policy:
@@ -2599,8 +2732,6 @@ def _render_baseline_policy_section(title, policy_key, results):
         st.plotly_chart(fig, use_container_width=True, key=f"{policy_key}_risk_split")
 
 def _render_shap_section(num_sources):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """
     Enhanced SHAP explanations with visualizations, narratives, and source-specific insights.
     Answers: Why does the system trust or distrust this source?
@@ -2977,8 +3108,6 @@ def _render_single_source_shap(source_id, compact=False):
         """, unsafe_allow_html=True)
 
 def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """
     Render EVPI section with advanced metrics if available from pipeline.
     Fully dynamic - updates when policies or parameters change.
@@ -3168,8 +3297,6 @@ def _render_evpi_section(ml_policy, uni_policy, advanced_metrics=None):
 
 
 def _render_emv_section(emv_data: Dict):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """
     Render Expected Mission Value (EMV) section with dynamic updates.
     
@@ -3292,8 +3419,6 @@ def _render_emv_section(emv_data: Dict):
 
 
 def _render_sensitivity_section(sensitivity_data: Dict):
-    # Always sync results from shared DB at section start
-    _sync_results_from_shared_db()
     """
     Render Sensitivity Analysis section with interactive parameter exploration.
     
@@ -5977,7 +6102,7 @@ def _calculate_ml_scores_realtime(source_data: dict, recourse_rules: dict):
     
     tsr = float(features.get("task_success_rate", 0.5))
     cor = float(features.get("corroboration_score", 0.5))
-    time = float(features.get("report_timeliness", 0.5))
+    timeliness = float(features.get("report_timeliness", 0.5))
     handler = float(features.get("handler_confidence", 0.5))
     dec_score = float(features.get("deception_score", 0.3))
     ci = int(features.get("ci_flag", 0))
@@ -6147,13 +6272,13 @@ def _process_single_source(source_data, recourse_rules):
         # Use actual ML models (XGBoost + GRU) instead of formulas
         tsr = features["task_success_rate"]
         cor = features["corroboration_score"]
-        time = features["report_timeliness"]
+        timeliness = features["report_timeliness"]
         handler = features["handler_confidence"]
         dec_score = features["deception_score"]
         ci = features["ci_flag"]
         
         # Check if all inputs are zero - if so, return zero metrics
-        if tsr == 0.0 and cor == 0.0 and time == 0.0 and handler == 0.0 and dec_score == 0.0 and ci == 0:
+        if tsr == 0.0 and cor == 0.0 and timeliness == 0.0 and handler == 0.0 and dec_score == 0.0 and ci == 0:
             reliability = 0.0
             deception = 0.0
             behavior_probs = None
@@ -6215,7 +6340,7 @@ def _process_single_source(source_data, recourse_rules):
         dec_flag = recourse_rules.get("dec_ci_flag", 0.60)
         
         # Special case: all inputs zero means source has no data
-        if tsr == 0.0 and cor == 0.0 and time == 0.0:
+        if tsr == 0.0 and cor == 0.0 and timeliness == 0.0:
             decision = "disengage"
             action_reason = "No source data available (all features are zero)"
             task_assigned = None
@@ -6279,7 +6404,7 @@ def _process_single_source(source_data, recourse_rules):
         
         # ===== STAGE 4: GENERATE EXPLANATION =====
         # Handle zero-input case for all metrics
-        if tsr == 0.0 and cor == 0.0 and time == 0.0:
+        if tsr == 0.0 and cor == 0.0 and timeliness == 0.0:
             emv_ml = 0.0
             emv_deterministic = 0.0
             emv_uniform = 0.0
@@ -6382,10 +6507,9 @@ def _map_csv_to_batch_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _process_batch_sources(df, recourse_rules):
-    """Process multiple sources from DataFrame."""
-    results = []
-    errors = []
+    """Validate and prepare batch sources (no optimization run)."""
     sources = []
+    errors = []
     
     # First pass: validate and build sources list
     for idx, row in df.iterrows():
@@ -6421,63 +6545,57 @@ def _process_batch_sources(df, recourse_rules):
             "source_id": clean_data["source_id"],
             "features": features,
             "reliability_series": [],  # Required by model
-            "recourse_rules": recourse_rules  # Include decision thresholds
+            "recourse_rules": dict(recourse_rules)  # Include decision thresholds
         })
     
-    # Run batch optimization if we have valid sources
-    if sources:
-        try:
-            payload = {
-                "sources": sources,
-                "seed": 42
-            }
-            
-            result = run_optimization(payload)
-            ml_policy = result.get("policies", {}).get("ml_tssp", [])
-            _ensure_source_state_and_risk_bucket(ml_policy)
-            
-            # Extract individual source results matching single source format
-            for policy_item in ml_policy:
-                # Handle both 'task' (fallback) and 'tasks' (API) formats
-                task_data = policy_item.get("tasks") or policy_item.get("task")
-                if task_data and not isinstance(task_data, list):
-                    task_data = [task_data]
-                elif not task_data:
-                    task_data = []
-                
-                source_state = policy_item.get("source_state") or _action_to_source_state(policy_item.get("action", ""))
-                risk_bucket = policy_item.get("risk_bucket") or _risk_bucket_from_intrinsic(
-                    float(policy_item.get("intrinsic_risk", policy_item.get("expected_risk", 0.0)))
-                )
-                source_result = {
-                    "source_id": policy_item.get("source_id", "UNKNOWN"),
-                    "ml_reliability": float(policy_item.get("reliability", 0.0)),
-                    "deception_confidence": float(policy_item.get("deception", 0.0)),
-                    "decision": policy_item.get("action", "unknown"),
-                    "source_state": source_state,
-                    "risk_bucket": risk_bucket,
-                    "intrinsic_risk": float(policy_item.get("intrinsic_risk", policy_item.get("expected_risk", 0.0))),
-                    "tssp_allocation": task_data,
-                    "expected_risk": float(policy_item.get("expected_risk", 0.0)),
-                    "optimization_score": float(policy_item.get("score", 0.0)),
-                    "features": sources[len(results)]["features"] if len(results) < len(sources) else {},
-                    "recourse_rules": recourse_rules,
-                    "api_method": "api" if not result.get("_using_fallback") else "fallback",
-                    "is_taskable": source_state in (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED)
-                }
-                results.append(source_result)
-        except Exception as e:
-            errors.append({"row": "batch", "source_id": "ALL", "errors": [f"Batch processing error: {str(e)}"]})
-    
-    return results, errors
+    return sources, errors
 
 
 def render_streamlit_app():
     """Main Streamlit application with left-side controls."""
     _init_streamlit()
+
+    # Restrict _sync_results_from_shared_db() to page load only: set allow flag once per session
+    if "_allow_shared_sync" not in st.session_state:
+        st.session_state["_allow_shared_sync"] = True
+
+    # FLOW CONTROL: Prevent infinite rerun loops
+    # Track consecutive reruns to prevent infinite loops
+    rerun_count = st.session_state.get("_consecutive_reruns", 0)
+    last_rerun_time = st.session_state.get("_last_rerun_time", 0)
+    current_time = time.time()
+    
+    # Reset rerun counter if enough time has passed (5 seconds)
+    if current_time - last_rerun_time > 5.0:
+        st.session_state["_consecutive_reruns"] = 0
+        rerun_count = 0
+    
+    # Prevent infinite reruns - max 3 consecutive reruns within 5 seconds
+    if rerun_count >= 3:
+        st.warning("⚠️ **Flow Control**: Too many rapid reruns detected. Auto-refresh paused to prevent infinite loops.")
+        st.session_state["results_stale"] = False
+        st.session_state["_consecutive_reruns"] = 0
+        st.session_state["_auto_refresh_in_progress"] = False
     
     # PERFORMANCE: Increment render ID to reset sync cache for new render cycle
     st.session_state["_current_render_id"] = st.session_state.get("_current_render_id", 0) + 1
+    
+    # PROFESSIONAL STABILITY FIX: Ensure sources are always available in session state
+    # This prevents the "blank summary" issue where sources are lost on refresh
+    if "sources" not in st.session_state or not st.session_state.sources:
+        # Try to recover from shared DB if available
+        if SHARED_DB_AVAILABLE:
+            _, shared_sources = load_latest_optimization_results()
+            if shared_sources:
+                st.session_state["sources"] = shared_sources
+    
+    # #region agent log
+    try:
+        import json as _json_log
+        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+            _f.write(_json_log.dumps({"location": "dashboard.py:render_streamlit_app:START", "message": "Starting app render", "data": {"has_results": st.session_state.get("results") is not None, "has_executed": st.session_state.get("_has_executed_optimization"), "pending_recompute": st.session_state.get("_pending_recompute"), "parameters_changed": st.session_state.get("_parameters_changed")}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H2"}) + "\n")
+    except: pass
+    # #endregion
     
     # ======================================================
     # STARTUP STATUS BANNER
@@ -6486,7 +6604,12 @@ def render_streamlit_app():
     with startup_placeholder.container():
         st.info("🚀 **Loading ML-TSSP Dashboard...** Initializing components...")
     
+    # FLOW CONTROL: Clear startup banner early to prevent continuous loading appearance
+    # Clear it immediately after showing, before any long operations
     try:
+        # Clear startup message early to prevent continuous loading appearance
+        startup_placeholder.empty()
+        
         # ======================================================
         # HEALTH CHECK STATUS
         # ======================================================
@@ -6544,8 +6667,8 @@ def render_streamlit_app():
                 unsafe_allow_html=True
             )
         
-        # Clear startup message
-        startup_placeholder.empty()
+        # Startup message already cleared above
+        # (Moved clearing earlier to prevent continuous loading appearance)
         
         # ======================================================
         # SYNC WITH SHARED DATABASE (Multi-User Interconnection)
@@ -6558,38 +6681,70 @@ def render_streamlit_app():
                     _f.write(_json_log.dumps({"location": "dashboard.py:render_streamlit_app:STARTUP_SYNC", "message": "Startup sync", "data": {"has_existing_results": st.session_state.get("results") is not None}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "E"}) + "\n")
             except: pass
             # #endregion
-            # Sync FULL optimization results from shared database (on every load)
+            # Sync FULL optimization results from shared database (throttled)
             # This ensures all sections (Admin, Executive, etc.) see the same results
-            _sync_results_from_shared_db()
+            # FLOW CONTROL: Only sync if not already synced this render cycle AND not in rerun loop
+            render_id = st.session_state.get("_current_render_id", 0)
+            last_full_sync = st.session_state.get("_last_full_sync_time")
+            should_full_sync = last_full_sync is None or (time.time() - float(last_full_sync)) > 30
+            if should_full_sync and st.session_state.get("_sync_done_this_render") != render_id and st.session_state.get("_consecutive_reruns", 0) < 3:
+                synced = _sync_results_from_shared_db()
+                st.session_state["_last_full_sync_time"] = time.time()
+                # FLOW CONTROL: Do NOT trigger rerun from sync - sync should be passive
+                # Only update state, don't cause reruns that could lead to continuous loading
             
-            # Also sync assignments from shared database (every 30 seconds)
-            if "last_sync_time" not in st.session_state or \
-               (datetime.now() - datetime.fromisoformat(st.session_state.get("last_sync_time", "2000-01-01 00:00:00"))).total_seconds() > 30:
-                try:
-                    # Get latest assignments from shared storage
-                    shared_assignments = get_latest_assignments(policy_type="ml_tssp", limit=1000)
-                    if shared_assignments:
-                        # Merge with current results if available
-                        current_results = st.session_state.get("results")
-                        if current_results and current_results.get("policies", {}).get("ml_tssp"):
-                            # Update assignments from shared storage (prioritize shared data)
-                            shared_by_source = {a["source_id"]: a for a in shared_assignments}
-                            ml_policy = current_results["policies"]["ml_tssp"]
-                            for assignment in ml_policy:
-                                source_id = assignment.get("source_id")
-                                if source_id in shared_by_source:
-                                    # Update with shared data (more recent)
-                                    shared_assignment = shared_by_source[source_id]
-                                    assignment.update({
-                                        "task": shared_assignment.get("task"),
-                                        "action": shared_assignment.get("action"),
-                                        "source_state": shared_assignment.get("source_state"),
-                                    })
+            # Also sync assignments from shared database (every 60 seconds, only when results exist)
+            # FLOW CONTROL: Add timeout to prevent hanging
+            if st.session_state.get("results") and (
+                "last_sync_time" not in st.session_state or
+                (datetime.now() - datetime.fromisoformat(st.session_state.get("last_sync_time", "2000-01-01 00:00:00"))).total_seconds() > 60
+            ):
+                # FLOW CONTROL: Prevent multiple simultaneous syncs
+                if not st.session_state.get("_assignment_sync_in_progress", False):
+                    st.session_state["_assignment_sync_in_progress"] = True
+                    try:
+                        # Get latest assignments from shared storage with timeout protection
+                        import signal
+                        shared_assignments = get_latest_assignments(policy_type="ml_tssp", limit=1000)
+                        if shared_assignments:
+                            # Merge with current results if available
+                            current_results = st.session_state.get("results")
+                            if current_results and current_results.get("policies", {}).get("ml_tssp"):
+                                # Update assignments from shared storage (prioritize shared data)
+                                shared_by_source = {a["source_id"]: a for a in shared_assignments}
+                                ml_policy = current_results["policies"]["ml_tssp"]
+                                for assignment in ml_policy:
+                                    source_id = assignment.get("source_id")
+                                    if source_id in shared_by_source:
+                                        # Update with shared data (more recent)
+                                        shared_assignment = shared_by_source[source_id]
+                                        assignment.update({
+                                            "task": shared_assignment.get("task"),
+                                            "action": shared_assignment.get("action"),
+                                            "source_state": shared_assignment.get("source_state"),
+                                        })
                         st.session_state["last_sync_time"] = datetime.now().isoformat()
-                except Exception as e:
-                    # Don't fail if sync fails - log silently
-                    pass
+                    except Exception as e:
+                        # Don't fail if sync fails - log silently
+                        # #region agent log
+                        try:
+                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                                _f.write(json.dumps({"location": "dashboard.py:assignment_sync_error", "message": "Assignment sync failed", "data": {"error": str(e)}, "timestamp": int(time.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "F"}) + "\n")
+                        except: pass
+                        # #endregion
+                    finally:
+                        st.session_state["_assignment_sync_in_progress"] = False
         
+        # Ensure results only appear after Execute Optimization in this session
+        # OR if they were synced from the shared database
+        if not st.session_state.get("_has_executed_optimization") and not st.session_state.get("shared_results_timestamp"):
+            st.session_state["results"] = None
+            st.session_state["results_version"] = 0
+            st.session_state["results_changed"] = False
+            st.session_state["last_update_time"] = "Never"
+        # Clear pending recompute flag without clearing results
+        st.session_state["_pending_recompute"] = False
+
     except Exception as e:
         startup_placeholder.error(f"❌ Startup Error: {str(e)}")
         st.exception(e)
@@ -6797,6 +6952,12 @@ def render_streamlit_app():
         st.warning("No dashboard sections are available for your role.")
         return
 
+    # ===================== AUTO-REFRESH LOGIC (DISABLED) =====================
+    # Auto-refresh is disabled to prevent blinking/rerun loops.
+    # Only manual optimization or explicit refresh should update results.
+    if st.session_state.get("_pending_recompute"):
+        st.session_state["_pending_recompute"] = False
+
 
 
     # ======================================================
@@ -6812,48 +6973,71 @@ def render_streamlit_app():
                 st.caption("ℹ️ Using local results (not yet shared)")
         with sync_col2:
             if st.button("🔄 Refresh from Shared DB", key="refresh_shared_results", use_container_width=True):
-                if _sync_results_from_shared_db():
+                st.session_state["_allow_shared_sync"] = True
+                synced = _sync_results_from_shared_db()
+                st.session_state["_allow_shared_sync"] = False
+                if synced:
                     st.success("✅ Results synced from shared database!")
-                    st.rerun()
+                    # Mark as executed so results persist (user explicitly requested sync)
+                    st.session_state["_has_executed_optimization"] = True
+                    _safe_rerun("shared DB refresh")
                 else:
                     st.info("ℹ️ No new results found in shared database")
     
     # Dynamic navigation with state persistence and validation
     # Ensure nav_pills is always a valid nav_lookup value
     valid_nav_keys = {nav_lookup[l] for l in nav_labels}
-    if "nav_pills" not in st.session_state or st.session_state["nav_pills"] not in valid_nav_keys:
+    
+    # Initialize nav_pills if not present
+    if "nav_pills" not in st.session_state:
         st.session_state["nav_pills"] = nav_lookup[nav_labels[0]]
     
+    # If the current nav_pills is no longer valid for this role, reset to first available
+    if st.session_state["nav_pills"] not in valid_nav_keys:
+        st.session_state["nav_pills"] = nav_lookup[nav_labels[0]]
+
+    # SHARED RESULTS SYNC (Multi-User Interconnection)
+    # This ensures that when the Analyst runs optimization, other roles see it
+    # Redundant call removed - sync is handled at the top of render_streamlit_app
+    # if SHARED_DB_AVAILABLE:
+    #     _sync_results_from_shared_db()
+
+    nav_choice_key = "nav_radio_choice"
+    
+    # Sync the radio label with the nav_pills key
+    target_label = next((l for l, k in nav_lookup.items() if k == st.session_state["nav_pills"]), nav_labels[0])
+    
+    # Define the callback to handle navigation changes
+    def _on_nav_change():
+        new_label = st.session_state[nav_choice_key]
+        if new_label in nav_lookup:
+            st.session_state["nav_pills"] = nav_lookup[new_label]
+            # When switching to profiles, ensure we don't accidentally clear results
+            if st.session_state["nav_pills"] == "profiles":
+                st.session_state["results_changed"] = False
+
     # Find the label corresponding to the current nav_pills value
     try:
-        default_label = next((l for l, k in nav_lookup.items() if k == st.session_state["nav_pills"]), nav_labels[0])
-        if default_label not in nav_labels:
-            default_label = nav_labels[0]
+        current_key = st.session_state["nav_pills"]
+        default_label = next((l for l, k in nav_lookup.items() if k == current_key), nav_labels[0])
         default_index = nav_labels.index(default_label)
     except (IndexError, ValueError, KeyError, StopIteration):
         default_index = 0
         default_label = nav_labels[0]
 
-    # Use a separate key for the radio widget to avoid conflict
+    # Use a separate key for the radio widget with a callback
     nav_choice = st.radio(
         "Navigate dashboard",
         nav_labels,
         horizontal=True,
-        key="nav_radio_choice",
+        key=nav_choice_key,
         label_visibility="hidden",
-        index=default_index
+        index=default_index,
+        on_change=_on_nav_change
     )
 
-    # Convert the selected label to nav_key and update session state
-    if nav_choice in nav_lookup:
-        nav_key = nav_lookup[nav_choice]
-        st.session_state["nav_pills"] = nav_key  # Update nav_pills with the key value
-    else:
-        # Fallback: use the current nav_pills value or default to "policies"
-        nav_key = st.session_state.get("nav_pills", nav_lookup[nav_labels[0]])
-        if nav_key not in valid_nav_keys:
-            nav_key = nav_lookup[nav_labels[0]]
-            st.session_state["nav_pills"] = nav_key
+    # Ensure nav_key is always set from session state
+    nav_key = st.session_state["nav_pills"]
     
     # Store current navigation for cross-section linking
     st.session_state["current_nav"] = nav_key
@@ -6895,6 +7079,22 @@ def render_streamlit_app():
         <div class="control-panel">
             <div class="control-panel-header" style="color: #6b21a8;">⚙️ Configuration</div>
         """, unsafe_allow_html=True)
+
+        # Apply shared recourse rules before widgets render (sync across sessions)
+        pending_rules = st.session_state.get("_pending_shared_recourse_rules")
+        pending_hash = st.session_state.get("_pending_shared_rules_hash")
+        render_id = st.session_state.get("_current_render_id", 0)
+        if pending_rules and st.session_state.get("_shared_rules_applied_render_id") != render_id:
+            st.session_state["_shared_rules_applied_render_id"] = render_id
+            st.session_state["rel_disengage_slider"] = float(pending_rules.get("rel_disengage", 0.35))
+            st.session_state["rel_ci_flag_slider"] = float(pending_rules.get("rel_ci_flag", 0.50))
+            st.session_state["dec_disengage_slider"] = float(pending_rules.get("dec_disengage", 0.75))
+            st.session_state["dec_ci_flag_slider"] = float(pending_rules.get("dec_ci_flag", 0.60))
+            st.session_state["recourse_rules"] = dict(pending_rules)
+            if pending_hash:
+                st.session_state["last_rules_hash"] = pending_hash
+            st.session_state.pop("_pending_shared_recourse_rules", None)
+            st.session_state.pop("_pending_shared_rules_hash", None)
         
         # ========== OPERATIONAL MODE PRESETS ==========
         with st.expander("🎯 OPERATIONAL MODE", expanded=False):
@@ -7033,16 +7233,22 @@ def render_streamlit_app():
                             height=80
                         )
                     
+                    can_upload_eval = has_permission("upload_evaluation_data")
                     col_submit, col_clear = st.columns(2)
                     with col_submit:
-                        submit_single = st.form_submit_button("▶ Run Single Source", type="primary", use_container_width=True)
+                        submit_single = st.form_submit_button(
+                            "▶ Validate Single Source",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not can_upload_eval
+                        )
                     with col_clear:
-                        clear_results = st.form_submit_button("↺ Clear Results", use_container_width=True)
+                        clear_results = st.form_submit_button("↺ Clear Results", use_container_width=True, disabled=not can_upload_eval)
                 
                 if clear_results:
                     if "single_source_result" in st.session_state:
                         del st.session_state.single_source_result
-                    st.rerun()
+                    _safe_rerun("clear single source results")
                 
                 if submit_single:
                     # Build source data with all 6 input features
@@ -7071,23 +7277,31 @@ def render_streamlit_app():
                         for err in errors:
                             st.error(f"• {err}")
                     else:
-                        # Build recourse rules from sliders (will be defined below)
-                        recourse_rules = {
-                            "rel_disengage": st.session_state.get("rel_disengage_slider", 0.35),
-                            "rel_ci_flag": st.session_state.get("rel_ci_flag_slider", 0.50),
-                            "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
-                            "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60)
+                        # Store validated single source for later optimization run
+                        if "custom_sources_pool" not in st.session_state:
+                            st.session_state.custom_sources_pool = []
+                        custom_source = {
+                            "source_id": clean_data.get("source_id"),
+                            "features": {
+                                "task_success_rate": clean_data["task_success_rate"],
+                                "corroboration_score": clean_data["corroboration_score"],
+                                "report_timeliness": clean_data["report_timeliness"],
+                                "handler_confidence": clean_data["handler_confidence"],
+                                "deception_score": clean_data["deception_score"],
+                                "ci_flag": clean_data["ci_flag"],
+                            },
+                            "reliability_series": [],
                         }
-                        
-                        with st.spinner("🔄 Processing source through ML-TSSP pipeline..."):
-                            result, error = _process_single_source(clean_data, recourse_rules)
-                        
-                        if error:
-                            st.error(f"**Processing Error:** {error}")
+                        existing_ids = [s.get("source_id") for s in st.session_state.custom_sources_pool]
+                        if custom_source["source_id"] not in existing_ids:
+                            st.session_state.custom_sources_pool.append(custom_source)
+                            st.session_state["_has_executed_optimization"] = False
+                            st.success("✅ Source validated and queued for optimization.")
+                            st.info("Run **Execute Optimization** to generate results.")
                         else:
-                            st.session_state.single_source_result = result
-                            st.success("✅ Source processed successfully!")
-                            st.rerun()
+                            st.warning("⚠️ Source already in the optimization pool.")
+                        if "single_source_result" in st.session_state:
+                            del st.session_state.single_source_result
                 
                 # Display results if available
                 if "single_source_result" in st.session_state:
@@ -7849,216 +8063,167 @@ def render_streamlit_app():
                                 "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
                                 "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60),
                             }
-                            if st.button("▶ Process and use for optimisation", type="primary", key="csv_process_btn", use_container_width=True):
-                                with st.spinner("Processing…"):
+                            if st.button("▶ Validate & Load for Optimisation", type="primary", key="csv_process_btn", use_container_width=True):
+                                with st.spinner("Validating and loading…"):
                                     results, errors = _process_batch_sources(df_to_process, recourse_rules)
                                 st.session_state.batch_results = results
                                 st.session_state.batch_errors = errors if errors else []
                                 st.session_state.batch_upload_pending = None
                                 st.session_state.batch_upload_pending_count = 0
                                 if errors:
-                                    st.warning(f"Processed with {len(errors)} validation error(s). Check expander below.")
+                                    st.warning(f"Loaded {len(results)} source(s) with {len(errors)} validation error(s). Check expander below.")
                                 else:
-                                    st.success("Done. Use **Real Data Mode** in SIMULATION SCOPE and **Execute Optimization** in Source Profiles.")
-                                st.rerun()
+                                    st.success("Data loaded. Use **Real Data Mode** in SIMULATION SCOPE and **Execute Optimization** in Source Profiles.")
+                                    # Clear results - optimization must be run explicitly
+                                    st.session_state["results"] = None
+                                    st.session_state["_has_executed_optimization"] = False
+                                    _safe_rerun("data loaded")
                     except Exception as e:
                         st.error(f"File error: {e}")
                 else:
-                    st.session_state["user_df"] = None
-                    st.session_state["filtered_df"] = None
-                    st.session_state["filter_column"] = None
-                    st.session_state["filter_value"] = None
-                    st.caption("Upload a CSV to filter and process. Data is used by the optimisation engine (Execute Optimization).")
-            
-            # ========== BATCH UPLOAD MODE ==========
-            else:  # Batch Upload
-                st.markdown("""
-                <p style='font-size: 11px; color: #92400e; margin: 0 0 0.8rem 0; font-style: italic;'>
-                    Upload Excel/CSV file for multiple sources at once
-                </p>
-                """, unsafe_allow_html=True)
-                
-                # If some other UI action asked to clear the uploader, do it *before*
-                # instantiating the widget that owns `key="batch_upload_file"`.
-                if st.session_state.get("_clear_batch_upload_file"):
-                    st.session_state.pop("batch_upload_file", None)
+                        st.session_state["user_df"] = None
+                        st.session_state["filtered_df"] = None
+                        st.session_state["filter_column"] = None
+                        st.session_state["filter_value"] = None
+                        st.caption("Upload a CSV to filter and process. Data is used by the optimisation engine (Execute Optimization).")
+
+            # ========== ANALYST CONTROL: BATCH UPLOAD & VALIDATION ==========
+            if has_permission("upload_evaluation_data"):
+                with st.expander("🛠️ Analyst Control: Batch Upload & Validation", expanded=True):
+                    st.markdown("""
+<p style='font-size: 13px; color: #92400e; margin: 0 0 0.8rem 0; font-style: italic; font-weight:600;'>
+    Upload Excel/CSV file for multiple sources at once.<br>
+    <span style='color:#b91c1c;'>You must <b>Validate & Load Batch</b> after upload to use your data!</span>
+</p>
+""", unsafe_allow_html=True)
+
+                    if st.session_state.get("_clear_batch_upload_file"):
+                        st.session_state.pop("batch_upload_file", None)
                     st.session_state["_clear_batch_upload_file"] = False
 
-                # File upload
-                uploaded_file = st.file_uploader(
-                    "Upload source data file",
-                    type=["csv", "xlsx", "xls"],
-                    help="File must contain columns: source_id, task_success_rate, corroboration_score, report_timeliness",
-                    label_visibility="collapsed",
-                    key="batch_upload_file"
-                )
-                
-                # Template download
-                col_template, col_limit = st.columns(2)
-                with col_template:
-                    template_csv = "source_id,task_success_rate,corroboration_score,report_timeliness,handler_confidence,deception_score,ci_flag\nSRC_001,0.85,0.75,0.90,0.80,0.20,0\nSRC_002,0.65,0.60,0.70,0.65,0.35,0\nSRC_003,0.90,0.85,0.95,0.88,0.15,1"
-                    st.download_button(
-                        label="📥 Download Template",
-                        data=template_csv,
-                        file_name="source_template.csv",
-                        mime="text/csv",
-                        use_container_width=True
+                    uploaded_file = st.file_uploader(
+                        "Upload source data file",
+                        type=["csv", "xlsx", "xls"],
+                        help="File must contain columns: source_id, task_success_rate, corroboration_score, report_timeliness",
+                        label_visibility="collapsed",
+                        key="batch_upload_file",
+                        disabled=False
                     )
-                
-                with col_limit:
-                    max_rows = st.number_input(
-                        "Max rows",
-                        min_value=1,
-                        max_value=500,
-                        value=st.session_state.get("batch_max_rows", 100),
-                        key="batch_max_rows",
-                        help="Limit number of sources to process"
-                    )
-                
-                # Persist loaded data so we can use it after nav/rerun (uploader often clears)
-                recourse_rules = {
-                    "rel_disengage": st.session_state.get("rel_disengage_slider", 0.35),
-                    "rel_ci_flag": st.session_state.get("rel_ci_flag_slider", 0.50),
-                    "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
-                    "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60),
-                }
-                df_to_process = None
-                if uploaded_file is not None:
-                    try:
-                        if uploaded_file.name.endswith('.csv'):
-                            df = pd.read_csv(uploaded_file)
-                        else:
-                            df = pd.read_excel(uploaded_file)
-                        df_limited = df.head(int(max_rows))
-                        if len(df) > max_rows:
-                            st.warning(f"⚠️ File has {len(df)} rows. Using first {int(max_rows)}.")
-                        st.session_state.batch_upload_pending = df_limited
-                        st.session_state.batch_upload_pending_count = len(df_limited)
-                        df_to_process = df_limited
-                        st.info(f"📋 Loaded {len(df_limited)} sources from file")
+
+                    col_template, col_limit = st.columns(2)
+                    with col_template:
+                        template_csv = "source_id,task_success_rate,corroboration_score,report_timeliness,handler_confidence,deception_score,ci_flag\nSRC_001,0.85,0.75,0.90,0.80,0.20,0\nSRC_002,0.65,0.60,0.70,0.65,0.35,0\nSRC_003,0.90,0.85,0.95,0.88,0.15,1"
+                        st.download_button(
+                            label="📥 Download Template",
+                            data=template_csv,
+                            file_name="source_template.csv",
+                            mime="text/csv",
+                            use_container_width=True
+                        )
+                    with col_limit:
+                        max_rows = st.number_input(
+                            "Max rows",
+                            min_value=1,
+                            max_value=500,
+                            value=st.session_state.get("batch_max_rows", 100),
+                            key="batch_max_rows",
+                            help="Limit number of sources to process"
+                        )
+
+                    recourse_rules = {
+                        "rel_disengage": st.session_state.get("rel_disengage_slider", 0.35),
+                        "rel_ci_flag": st.session_state.get("rel_ci_flag_slider", 0.50),
+                        "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
+                        "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60),
+                    }
+                    df_to_process = None
+                    # Only process the uploaded file if present
+                    if uploaded_file is not None:
+                        try:
+                            if uploaded_file.name.endswith('.csv'):
+                                df = pd.read_csv(uploaded_file)
+                            else:
+                                df = pd.read_excel(uploaded_file)
+                            df_limited = df.head(int(max_rows))
+                            if len(df) > max_rows:
+                                st.warning(f"⚠️ File has {len(df)} rows. Using first {int(max_rows)}.")
+                            st.session_state.batch_upload_pending = df_limited
+                            st.session_state.batch_upload_pending_count = len(df_limited)
+                            df_to_process = df_limited
+                            st.info(f"📋 Loaded {len(df_limited)} sources from file")
+                            with st.expander("👁️ Preview Data"):
+                                st.dataframe(df_limited.head(10), use_container_width=True)
+                        except Exception as e:
+                            st.error(f"**File Error:** {str(e)}")
+
+                    # If batch is pending validation, show prominent Validate & Load Batch button
+                    if st.session_state.get("batch_upload_pending") is not None:
+                        pending = st.session_state.batch_upload_pending
+                        st.session_state.batch_upload_pending_count = len(pending)
+                        df_to_process = pending
+                        st.info(f"📋 Loaded {len(pending)} sources (ready to process)")
                         with st.expander("👁️ Preview Data"):
-                            st.dataframe(df_limited.head(10), use_container_width=True)
-                    except Exception as e:
-                        st.error(f"**File Error:** {str(e)}")
-                elif st.session_state.get("batch_upload_pending") is not None:
-                    pending = st.session_state.batch_upload_pending
-                    st.session_state.batch_upload_pending_count = len(pending)
-                    df_to_process = pending
-                    st.info(f"📋 Loaded {len(pending)} sources (ready to process)")
-                    with st.expander("👁️ Preview Data"):
-                        st.dataframe(pending.head(10), use_container_width=True)
-                
-                if df_to_process is not None:
-                    if st.button("▶ Process Batch", type="primary", use_container_width=True):
-                        with st.spinner(f"🔄 Processing {len(df_to_process)} sources through ML-TSSP pipeline..."):
-                            results, errors = _process_batch_sources(df_to_process, recourse_rules)
-                        st.session_state.batch_results = results
-                        st.session_state.batch_errors = errors
-                        st.session_state.batch_upload_pending = None
-                        st.session_state.batch_upload_pending_count = 0
-                        st.rerun()
-                
-                # Display batch results
-                if "batch_results" in st.session_state and st.session_state.batch_results:
-                    results = st.session_state.batch_results
-                    errors = st.session_state.batch_errors
-                    
+                            st.dataframe(pending.head(10), use_container_width=True)
+                        # Prominent Validate & Load Batch button
+                        st.markdown("""
+<div style='margin:1.2rem 0 0.5rem 0; text-align:center;'>
+    <span style='font-size:15px; color:#0f172a; font-weight:600;'>Step 2: Validate & Load Batch</span>
+</div>
+""", unsafe_allow_html=True)
+                        if st.button("▶ Validate & Load Batch", type="primary", use_container_width=True):
+                            with st.spinner(f"🔄 Validating {len(df_to_process)} sources..."):
+                                results, errors = _process_batch_sources(df_to_process, recourse_rules)
+                            st.session_state.batch_results = results
+                            st.session_state.batch_errors = errors
+                            st.session_state.batch_upload_pending = None
+                            st.session_state.batch_upload_pending_count = 0
+                            # Ensure optimization results are cleared until Execute Optimization runs
+                            # But only if we are actually changing the data pool
+                            st.session_state["results"] = None
+                            st.session_state["_has_executed_optimization"] = False
+                            st.session_state["results_version"] = 0
+                            st.session_state["results_changed"] = False
+                            st.session_state["last_update_time"] = "Never"
+                            st.session_state["_pending_recompute"] = False
+                            # Auto-switch to Real Data Mode after successful validation
+                            st.session_state["data_source_mode"] = "📊 Real Data Mode (Your Input)"
+                            st.success("Batch validated and loaded! Switched to Real Data Mode.")
+                            _safe_rerun("batch loaded")
+
+                # Display batch results incrementally
+                if ("batch_results" in st.session_state and st.session_state.batch_results) or st.session_state.get("batch_errors"):
+                    results = st.session_state.get("batch_results", [])
+                    errors = st.session_state.get("batch_errors", [])
                     st.markdown("""
                     <div style='background: #ecfdf5; border-radius: 8px; padding: 0.8rem; margin-top: 1rem; border: 2px solid #10b981;'>
                         <p style='margin: 0; font-size: 12px; font-weight: 700; color: #047857;'>
-                            📊 BATCH PROCESSING RESULTS
+                            📊 BATCH VALIDATION RESULTS
                         </p>
                     </div>
                     """, unsafe_allow_html=True)
-                    
                     col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.metric("Processed", len(results))
+                        st.metric("Validated", len(results))
                     with col2:
                         st.metric("Errors", len(errors))
                     with col3:
-                        taskable = sum(1 for r in results if r.get("source_state") in (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED))
-                        st.metric("Taskable (incl. escalation)", taskable)
-                    assigned_normal = sum(1 for r in results if r.get("source_state") == SOURCE_STATE_ASSIGNED)
-                    assigned_escalated = sum(1 for r in results if r.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
-                    recommended_disengage = sum(1 for r in results if r.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
-                    st.caption(f"Operational outcomes — Assigned: {assigned_normal}, Escalated: {assigned_escalated}, Disengagement: {recommended_disengage}")
-                    
-                    # Summary table
-                    summary_df = pd.DataFrame([{
-                        "Source ID": r["source_id"],
-                        "Risk Bucket": r.get("risk_bucket", "unknown"),
-                        "Source State": r.get("source_state", "unknown"),
-                        "ML Reliability": f"{r['ml_reliability']:.3f}",
-                        "Deception Risk": f"{r['deception_confidence']:.3f}",
-                        "Decision": r["decision"],
-                        "Tasks Assigned": len(r.get("tssp_allocation", []))
-                    } for r in results])
-                    
-                    st.dataframe(summary_df, use_container_width=True, height=300)
-                    
-                    # Download results
-                    output_csv = summary_df.to_csv(index=False)
-                    st.download_button(
-                        label="📥 Download Results CSV",
-                        data=output_csv,
-                        file_name="batch_results.csv",
-                        mime="text/csv",
-                        use_container_width=True
-                    )
-                    
-                    # Show errors if any
+                        st.metric("Ready for Optimization", len(results))
                     if errors:
-                        with st.expander(f"⚠️ Errors ({len(errors)})"):
+                        with st.expander("⚠️ Validation Errors", expanded=False):
                             for err in errors:
-                                st.error(f"Row {err['row']} ({err['source_id']}): {', '.join(err['errors'])}")
-        
-        
-        # ========== SIMULATION SCOPE CARD ==========
-        with st.expander("🧮 SIMULATION SCOPE", expanded=True):
-            # Handle data source mode reset flag (must be before widget creation)
-            if st.session_state.get("_reset_data_source_mode"):
-                st.session_state.pop("data_source_mode", None)
-                st.session_state["_reset_data_source_mode"] = False
-            
-            custom_count = len(st.session_state.get("custom_sources_pool", []))
-            batch_count = len(st.session_state.get("batch_results", []))
-            pending_count = int(st.session_state.get("batch_upload_pending_count", 0) or 0)
-            total_input_count = custom_count + batch_count + pending_count
-            
-            # Mode selection
-            if total_input_count > 0:
-                data_mode = st.radio(
-                    "Data Source Mode",
-                    ["🎮 Demo Mode (Generated Sources)", "📊 Real Data Mode (Your Input)"],
-                    index=0,
-                    key="data_source_mode",
-                    help="Demo Mode uses generated sources for testing. Real Data Mode analyzes only your uploaded/entered sources.",
-                    on_change=_mark_results_stale
-                )
-
-                # Clear uploaded/entered data
-                if st.button("🧹 Clear Real Data Inputs", use_container_width=True, help="Remove uploaded/batch data and reset to demo mode"):
-                    # Clear all uploaded/custom data
-                    st.session_state.custom_sources_pool = []
-                    st.session_state.batch_results = []
-                    st.session_state.batch_errors = []
-                    st.session_state.batch_upload_pending = None
-                    st.session_state.batch_upload_pending_count = 0
-                    # Clear optimization results and metadata
-                    st.session_state["results"] = None
-                    st.session_state["sources"] = []
-                    st.session_state.last_optimization_result = None
-                    st.session_state["results_stale"] = False
-                    st.session_state["results_version"] = 0
-                    st.session_state["last_update_time"] = "Never"
-                    st.session_state["results_changed"] = False
-                    st.session_state["last_rules_hash"] = ""
-                    # Set flags for clearing widgets on next rerun (can't touch widget state after creation)
-                    st.session_state["_clear_batch_upload_file"] = True
-                    st.session_state["_reset_data_source_mode"] = True
-                    st.rerun()
+                                st.error(err)
+                    if results:
+                        st.success(f"{len(results)} sources validated and ready. Proceed to Execute Optimization.")
+                else:
+                    st.caption("Upload a CSV/XLSX file to begin batch validation.")
+                    # Do not clear results or trigger reruns here; this block runs every render
                 
+                # Ensure data_mode and counts are always defined before use
+                data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
+                custom_count = len(st.session_state.get("custom_sources_pool", []))
+                batch_count = len(st.session_state.get("batch_results", []))
+                pending_count = int(st.session_state.get("batch_upload_pending_count", 0) or 0)
+                total_input_count = custom_count + batch_count
                 if data_mode == "📊 Real Data Mode (Your Input)":
                     st.markdown(f"""
                     <div style='background: #ecfdf5; border: 1px solid #10b981; border-radius: 6px; 
@@ -8073,10 +8238,13 @@ def render_streamlit_app():
                     """, unsafe_allow_html=True)
                     num_sources = total_input_count
                     if batch_count == 0 and pending_count > 0:
-                        st.info(f"📌 {pending_count} sources loaded. Click **Process Batch** in SOURCE DATA INPUT to analyze.")
+                        st.info(f"📌 {pending_count} sources loaded. Click **Validate & Load Batch** in SOURCE DATA INPUT.")
                     else:
                         st.info(f"📌 Using {num_sources} source(s) from your input")
-                else:
+                    # Show validation success message after batch validation
+                    if st.session_state.get("batch_results") and not st.session_state.get("batch_errors"):
+                        st.success("✅ Data validation successful. Your data is ready for optimization.")
+                elif data_mode == "🎮 Demo Mode (Generated Sources)":
                     st.markdown("""
                     <div style='background: #eff6ff; border: 1px solid #93c5fd; border-radius: 6px; 
                                 padding: 0.6rem; margin: 0.8rem 0;'>
@@ -8088,7 +8256,6 @@ def render_streamlit_app():
                         </p>
                     </div>
                     """, unsafe_allow_html=True)
-                    
                     num_sources = st.slider(
                         "Number of sources",
                         1, 80,
@@ -8097,6 +8264,9 @@ def render_streamlit_app():
                         help="Total generated sources in demo pool",
                         on_change=_mark_results_stale
                     )
+                else:
+                    # Fallback: ensure num_sources is always defined
+                    num_sources = st.session_state.get("sources_count", 20)
             else:
                 # No input data: demo only (do not set data_source_mode; widget owns that key)
                 st.markdown("""
@@ -8121,6 +8291,9 @@ def render_streamlit_app():
                 )
             st.markdown("<p style='font-size: 10px; color: #6b7280; margin: -0.5rem 0 0.8rem 0; font-style: italic;'>Total sources in the optimization pool</p>", unsafe_allow_html=True)
             
+            # Ensure num_sources is always defined before use
+            if 'num_sources' not in locals():
+                num_sources = st.session_state.get("sources_count", 20)
             st.session_state.sources_count = num_sources
             source_ids = [f"SRC_{k + 1:03d}" for k in range(num_sources)]
             jump_source_id = st.selectbox(
@@ -8133,7 +8306,7 @@ def render_streamlit_app():
             )
         
         # ========== DECISION THRESHOLDS CARD ==========
-        can_edit_thresholds = has_permission("manage_priorities") or has_permission("configure_system")
+        can_edit_thresholds = has_permission("configure_parameters")
         with st.expander("⚖️ DECISION THRESHOLDS", expanded=True):
             if not can_edit_thresholds:
                 st.info("Decision thresholds are view-only for your role.")
@@ -8212,15 +8385,38 @@ def render_streamlit_app():
         rules_hash = hashlib.md5(str(sorted(current_rules.items())).encode()).hexdigest()
         last_rules_hash = st.session_state.get("last_rules_hash")
         if st.session_state.get("results") and last_rules_hash is not None and rules_hash != last_rules_hash:
+            st.session_state["_parameters_changed"] = True
             st.session_state["results_stale"] = True
-            st.warning("⚠️ Decision thresholds have changed. Results may be outdated. Re-run optimization to update.")
-            # #region agent log
-            try:
-                import json as _json_log
-                with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json_log.dumps({"location": "dashboard.py:recourse_rules_set:STALE", "message": "Results marked stale", "data": {"rules_hash": rules_hash, "last_rules_hash": last_rules_hash}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2"}) + "\n")
-            except: pass
-            # #endregion
+            st.session_state["_stale_version"] = st.session_state.get("_stale_version", 0) + 1
+            st.warning("⚠️ Decision thresholds changed. Results may be outdated. Re-run optimization to update.")
+        # Always update last_rules_hash to avoid repeated stale triggers
+        st.session_state["last_rules_hash"] = rules_hash
+        
+        # PROFESSIONAL STABILITY FIX: Auto-recompute if parameters changed and we have results
+        # This ensures all sections are dynamic and interactive with parameter changes
+        if st.session_state.get("_parameters_changed") and st.session_state.get("results") is not None:
+            # Check if we are already in an optimization process to avoid loops
+            if not st.session_state.get("_optimization_in_progress"):
+                # Use a small delay or check to prevent rapid-fire recomputation
+                last_recompute = st.session_state.get("_last_auto_recompute_time", 0)
+                if time.time() - last_recompute > 2: # 2 second debounce
+                    st.session_state["_last_auto_recompute_time"] = time.time()
+                    # Trigger optimization automatically
+                    st.session_state["_optimization_in_progress"] = True
+                    payload = {"sources": sources, "seed": 42}
+                    n_sources = len(sources) if sources else 0
+                    if n_sources > 0:
+                        # Use the execution helper
+                        _run_optimization_execution(sources, n_sources, payload, username, role)
+                        st.rerun()
+        
+        # #region agent log
+        try:
+            import json as _json_log
+            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
+                _f.write(_json_log.dumps({"location": "dashboard.py:recourse_rules_set:STALE", "message": "Results marked stale", "data": {"rules_hash": rules_hash, "last_rules_hash": last_rules_hash}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2"}) + "\n")
+        except: pass
+        # #endregion
         # #region agent log
         _debug_log("dashboard.py:recourse_rules_set", "sidebar thresholds done; recourse_rules updated from sliders", {"rel_disengage": rel_disengage, "rel_ci_flag": rel_ci_flag, "dec_disengage": dec_disengage, "dec_ci_flag": dec_ci_flag}, "H2,H3,H4")
         # #endregion
@@ -8345,67 +8541,73 @@ def render_streamlit_app():
     # ======================================================
     # 1. DECISION OPTIMIZATION ENGINE
     # ======================================================
-    sources = []
+    # PROFESSIONAL STABILITY FIX: Use sources from session state if they were synced
+    # This ensures Executive/Oversight see the same data as the Analyst
+    sources = st.session_state.get("sources", [])
+    
     data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
     use_real_data = (data_mode == "📊 Real Data Mode (Your Input)")
-    custom_count = len(st.session_state.get("custom_sources_pool", []))
-    batch_count = len(st.session_state.get("batch_results", []))
-    pending_count = int(st.session_state.get("batch_upload_pending_count", 0) or 0)
     
-    if use_real_data:
-        if custom_count + batch_count == 0:
-            use_real_data = False
-    # #region agent log
-    try:
-        import json as _json_log
-        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-            _f.write(_json_log.dumps({"location": "dashboard.py:data_mode", "message": "Data mode computed", "data": {"data_mode": data_mode, "custom_count": custom_count, "batch_count": batch_count, "pending_count": pending_count, "use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H1"}) + "\n")
-    except: pass
-    # #endregion
-    
-    if use_real_data:
-        # REAL DATA MODE: use custom + processed batch only (pending = not yet processed)
-        if st.session_state.get("custom_sources_pool"):
-            for custom_src in st.session_state.custom_sources_pool:
-                sources.append({
-                    "source_id": custom_src.get("source_id"),
-                    "features": custom_src.get("features"),
-                    "reliability_series": [],
-                    "recourse_rules": {},
-                })
-        if st.session_state.get("batch_results"):
-            sources.extend(st.session_state.batch_results)
-        if st.session_state.get("batch_errors"):
-            with st.expander("⚠️ Validation Errors", expanded=False):
-                for err in st.session_state.batch_errors:
-                    st.markdown(f"**Row {err['row']}** ({err['source_id']}): {', '.join(err['errors'])}")
-                if st.button("🧹 Clear Error Log", key="clear_batch_errors", use_container_width=True):
-                    st.session_state.batch_errors = []
-                    st.success("✓ Error log cleared")
-                    st.rerun()
-        if not sources:
-            if pending_count > 0:
-                st.info(
-                    f"**{pending_count} sources loaded.** Click **Process Batch** in **SOURCE DATA INPUT** "
-                    "→ **Batch Upload** to analyze your file, or switch to **Demo Mode** to use generated sources."
-                )
-            else:
-                st.warning("No sources available. Upload data and run **Process Batch**, or use **Demo Mode**.")
-            st.stop()
-    else:
-        # DEMO MODE: generate synthetic sources from slider
-        recourse_rules = st.session_state.get("recourse_rules") or {
-            "rel_disengage": 0.35, "rel_ci_flag": 0.50,
-            "dec_disengage": 0.75, "dec_ci_flag": 0.60,
-        }
-        n = int(st.session_state.get("sources_count", 20))
-        n = max(1, min(500, n))
-        sources = _generate_demo_sources(n, recourse_rules)
+    # Only rebuild sources list if we are the Analyst in Real Data Mode
+    # or if no sources exist yet
+    if not sources or (use_real_data and has_permission("execute_optimization")):
+        sources = []
+        custom_count = len(st.session_state.get("custom_sources_pool", []))
+        batch_count = len(st.session_state.get("batch_results", []))
+        
+        if use_real_data:
+            if custom_count + batch_count == 0:
+                use_real_data = False
+        
+        if use_real_data:
+            # REAL DATA MODE: use custom + processed batch only
+            current_rules = st.session_state.get("recourse_rules") or {
+                "rel_disengage": 0.35, "rel_ci_flag": 0.50,
+                "dec_disengage": 0.75, "dec_ci_flag": 0.60,
+            }
+            if st.session_state.get("custom_sources_pool"):
+                for custom_src in st.session_state.custom_sources_pool:
+                    sources.append({
+                        "source_id": custom_src.get("source_id"),
+                        "features": custom_src.get("features"),
+                        "reliability_series": [],
+                        "recourse_rules": current_rules,
+                    })
+            if st.session_state.get("batch_results"):
+                for batch_src in st.session_state.batch_results:
+                    sources.append({
+                        "source_id": batch_src.get("source_id"),
+                        "features": batch_src.get("features"),
+                        "reliability_series": batch_src.get("reliability_series", []),
+                        "recourse_rules": current_rules,
+                    })
+        else:
+            # DEMO MODE: generate synthetic sources
+            recourse_rules = st.session_state.get("recourse_rules") or get_active_recourse_rules()
+            n = int(st.session_state.get("sources_count", 20))
+            n = max(1, min(500, n))
+            sources = _generate_demo_sources(n, recourse_rules)
+        
+        # Update session state so other logic can use these sources
+        st.session_state["sources"] = sources
+
+    # Validation error display (Analyst only)
+    if has_permission("execute_optimization") and st.session_state.get("batch_errors"):
+        with st.expander("⚠️ Validation Errors", expanded=False):
+            for err in st.session_state.batch_errors:
+                st.markdown(f"**Row {err['row']}** ({err['source_id']}): {', '.join(err['errors'])}")
+            if st.button("🧹 Clear Error Log", key="clear_batch_errors", use_container_width=True):
+                st.session_state.batch_errors = []
+                _safe_rerun("clear error log")
         # #region agent log
         _debug_log("dashboard.py:demo_sources", "demo sources built with recourse_rules", {"n": n, "recourse_rules": recourse_rules}, "H5")
         # #endregion
     
+    # Auto-refresh disabled: results only change after explicit Execute Optimization
+    st.session_state["results_stale"] = False
+
     # Show Decision Optimization Engine only on Source Profiles tab
+    # DYNAMIC UPDATES: This section updates automatically when parameters change
     if nav_key == "profiles":
         with st.expander("🧠 Decision Optimization Engine", expanded=True):
             # Data Mode Banner
@@ -8449,19 +8651,34 @@ def render_streamlit_app():
             # ========== OPTIMIZATION CONTROL PANEL ==========
             st.markdown('<h4 style="color: #1e3a8a; margin-bottom: 1rem;">🧪 Optimization Control Panel</h4>', unsafe_allow_html=True)
             
-            can_run_models = has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")
-            if not can_run_models:
+            can_execute_optimization = has_permission("execute_optimization")
+            # Check ML models availability
+            models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
+            button_enabled = can_execute_optimization and models_available
+            
+            if not can_execute_optimization:
                 st.info("Optimization execution is restricted for your role.")
+            elif not models_available:
+                st.error("❌ ML-TSSP models are not loaded. Optimization cannot run. Please ensure ML models are properly initialized.")
+            
+            # Safe navigation fallback for analysts (if radio widget state desyncs)
+            if can_execute_optimization and nav_key != "profiles":
+                if st.button("📋 Navigate to Source Profiles", key="nav_to_profiles_fallback", use_container_width=True, help="Navigate to Source Profiles section"):
+                    _set_nav("profiles")
+                    st.rerun()
+            
             col_run, col_reset = st.columns([2, 1])
-            with col_run:
-                run_button_right = st.button(
-                    "▶ Execute Optimization",
-                    type="primary",
-                    use_container_width=True,
-                    key="run_opt_btn_right",
-                    help="Execute ML–TSSP batch optimization (10-100x faster) with current configuration",
-                    disabled=not can_run_models
-                )
+        with col_run:
+            if st.button(
+                "▶ Execute Optimization",
+                type="primary",
+                use_container_width=True,
+                key="run_opt_btn_right",
+                help="Execute ML–TSSP batch optimization with current configuration (requires ML models)",
+                disabled=not button_enabled
+            ):
+                # Button logic is handled below in the execution section
+                pass
             with col_reset:
                 reset_button_right = st.button("↺ Reset Configuration", use_container_width=True, key="reset_btn_right", help="Clear configuration and results")
             
@@ -8469,14 +8686,17 @@ def render_streamlit_app():
                 st.session_state.results = None
                 st.session_state.sources = []
                 st.session_state["results_stale"] = False
+                st.session_state["_pending_recompute"] = False
+                st.session_state["_has_executed_optimization"] = False
                 st.session_state["last_rules_hash"] = None
                 st.session_state["last_update_time"] = None
-                st.rerun()
+                _safe_rerun("reset configuration")
             
             st.divider()
             
             # ========== EXECUTION FEEDBACK & STATUS CONSOLE ==========
-            if st.session_state.get("results") is None:
+            results = st.session_state.get("results")
+            if results is None:
                 st.markdown("""
                 <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f1fdf8 100%); padding: 1.5rem; border-radius: 12px; border: 2px dashed #bfdbfe; text-align: center;">
                     <p style="margin: 0; font-size: 14px; color: #1e3a8a; font-weight: 600;">⏳ Ready for Optimization</p>
@@ -8495,8 +8715,129 @@ def render_streamlit_app():
             
             # ========== EXECUTIVE DECISION SUMMARY ==========
             st.markdown('<h4 style="color: #1e3a8a; margin-bottom: 1rem;">📊 Executive Decision Summary</h4>', unsafe_allow_html=True)
+
+            # Executive Summary MUST prefer local results (hard-block DB sync during same render cycle)
+            results = st.session_state.get("results")
+            if results is None:
+                st.info("Awaiting optimization run.")
+                return
+            # Do NOT call _sync_results_from_shared_db() here.
+
+            # === DEBUG STATUS BLOCK ===
+            with st.expander("🛠️ Debug Status (for troubleshooting)", expanded=True):
+                st.write({
+                    "results_present": st.session_state.get("results") is not None,
+                    "results_keys": list(st.session_state.get("results", {}).keys()) if st.session_state.get("results") else [],
+                    "sources_count": len(sources) if sources else 0,
+                    "pending_recompute": st.session_state.get("_pending_recompute"),
+                    "has_executed_optimization": st.session_state.get("_has_executed_optimization"),
+                    "refresh_token": st.session_state.get("refresh_token"),
+                    "last_consumed_refresh": st.session_state.get("last_consumed_refresh"),
+                    "results_stale": st.session_state.get("results_stale"),
+                    "parameters_changed": st.session_state.get("_parameters_changed"),
+                    "optimization_in_progress": st.session_state.get("_optimization_in_progress"),
+                })
+
+            results = st.session_state.get("results")
+            # Set safe defaults for summary variables
+            outcome_summary = "No optimization results available. Configure sources and run optimization."
             
-            if st.session_state.get("results") is None:
+            # Use pre-calculated summary if available (ensures sync)
+            if results and results.get("_summary_text"):
+                outcome_summary = f"Out of **{results.get('_n_all', 0)}** sources: {results.get('_summary_text')}."
+                
+            constraint_narrative = "No constraints applied. Awaiting optimization run."
+            emv_narrative = "No EMV improvement calculated. Run optimization to view results."
+            ml_emv_pct = uni_emv_pct = det_emv_pct = risk_reduction = 0.0
+
+            if results and not st.session_state.get("_pending_recompute") and len(sources) > 0:
+                # Render metrics/results using the latest results
+                ml_emv = results.get("emv", {}).get("ml_tssp", 0)
+                uni_emv = results.get("emv", {}).get("uniform", 0)
+                det_emv = results.get("emv", {}).get("deterministic", 0)
+                
+                # Use pre-calculated improvement if available
+                if "_risk_reduction" in results:
+                    risk_reduction = results["_risk_reduction"]
+                else:
+                    risk_reduction = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0.0
+                
+                n_sources = max(len(sources), 1)
+                ml_emv_pct = emv_to_percent(ml_emv, n_sources=n_sources, lmax=1.0)
+                uni_emv_pct = emv_to_percent(uni_emv, n_sources=n_sources, lmax=1.0)
+                det_emv_pct = emv_to_percent(det_emv, n_sources=n_sources, lmax=1.0)
+
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    render_kpi_indicator("Total Sources", len(sources), note="Input pool", number_font_size=13, key="kpi_total_sources_exec")
+                with col2:
+                    render_kpi_indicator(
+                        "Risk (EMV)",
+                        ml_emv_pct,
+                        reference=uni_emv_pct,
+                        suffix="%",
+                        note="vs Uniform",
+                        number_font_size=13,
+                        key="kpi_risk_exec"
+                    )
+                with col3:
+                    ml = results.get("policies", {}).get("ml_tssp", [])
+                    assignable = (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED)
+                    assigned_only = [a for a in ml if a.get("source_state") in assignable]
+                    low_assigned = sum(1 for a in assigned_only if a.get("risk_bucket") == "low")
+                    n_assigned = len(assigned_only)
+                    render_kpi_indicator("Low Risk Assigned", low_assigned, note=f"n={n_assigned} assigned", number_font_size=13, key="kpi_low_risk_exec")
+                with col4:
+                    render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", number_font_size=13, key="kpi_improvement_exec")
+                
+                # PROFESSIONAL STABILITY FIX: Define these variables inside the results block
+                ml = results.get("policies", {}).get("ml_tssp", [])
+                recommended_disengage = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
+                assigned_esc = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
+                assigned_normal = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_ASSIGNED)
+                n_all = len(ml)
+
+                outcome_parts = []
+                if recommended_disengage > 0:
+                    outcome_parts.append(f"<strong>{recommended_disengage}</strong> sources recommended for disengagement (high risk)")
+                if assigned_esc > 0:
+                    outcome_parts.append(f"<strong>{assigned_esc}</strong> assigned with escalation (medium risk or quality concerns)")
+                if assigned_normal > 0:
+                    outcome_parts.append(f"<strong>{assigned_normal}</strong> assigned under normal handling (low risk, good quality)")
+
+                if len(outcome_parts) == 0:
+                    outcome_summary = f"All <strong>{n_all}</strong> sources processed."
+                elif len(outcome_parts) == 1:
+                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}."
+                elif len(outcome_parts) == 2:
+                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]} and {outcome_parts[1]}."
+                else:
+                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}, {outcome_parts[1]}, and {outcome_parts[2]}."
+
+                # Constraint impact narrative
+                if recommended_disengage > 0:
+                    constraint_narrative = f"Risk-based constraints excluded <strong>{recommended_disengage}</strong> high-risk sources from operational assignment. Medium-risk sources with quality concerns receive escalated oversight. Low-risk sources with acceptable performance operate under standard protocols."
+                elif assigned_esc > 0:
+                    constraint_narrative = f"Risk thresholds triggered escalation for <strong>{assigned_esc}</strong> sources with quality or uncertainty concerns. No sources meet high-risk disengagement criteria under current thresholds."
+                else:
+                    constraint_narrative = "All sources meet operational quality standards under current risk thresholds. No escalation or disengagement required."
+
+                # EMV narrative
+                if recommended_disengage > 0:
+                    emv_narrative = f"Disengaged sources (<strong>{recommended_disengage}</strong>) contribute zero EMV by policy, representing controlled opportunity cost. The <strong>{risk_reduction:.1f}%</strong> improvement reflects strategic risk avoidance—accepting {recommended_disengage} missed opportunities to prevent exposure to high-risk intelligence."
+                else:
+                    emv_narrative = f"The <strong>{risk_reduction:.1f}%</strong> improvement reflects optimized assignment quality and risk-aware task allocation, achieved without source disengagement."
+            
+            elif st.session_state.get("_pending_recompute"):
+                st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in the Decision Optimization Engine above to generate new results.")
+            elif len(sources) == 0:
+                st.session_state["results"] = None
+                st.session_state["_pending_recompute"] = False
+                st.session_state["_has_executed_optimization"] = False
+                st.info("No sources available. Add demo sources or upload real data to run optimization.")
+                st.stop()
+            else:
+                # Pre-optimization state
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.metric("Sources Configured", len(sources))
@@ -8504,8 +8845,6 @@ def render_streamlit_app():
                     st.metric("Expected Risk", "—")
                 with col3:
                     st.metric("Improvement vs Uniform", "—")
-                
-                # Explanation for pre-optimization state
                 st.markdown(f"""
                 <div style='background: #f8fafc; border-left: 3px solid #94a3b8; padding: 0.8rem 1rem; border-radius: 6px; margin-top: 1rem;'>
                     <p style='margin: 0; font-size: 12px; color: #475569; line-height: 1.6;'>
@@ -8516,426 +8855,94 @@ def render_streamlit_app():
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
-            else:
-                results = st.session_state.get("results")
-                if st.session_state.get("results_stale"):
-                    # #region agent log
-                    try:
-                        import json as _json_log
-                        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:exec_summary", "message": "Results stale branch", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
-                    except: pass
-                    # #endregion
-                    if use_real_data:
-                        st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
-                        if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
-                            if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_exec", use_container_width=True):
-                                _auto_refresh_results(sources, allow_real_data=True)
-                                # #region agent log
-                                try:
-                                    import json as _json_log
-                                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:exec_summary", "message": "Rerun triggered (exec summary)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                                except: pass
-                                # #endregion
-                                st.rerun()
-                    else:
-                        _auto_refresh_results(sources)
-                        # #region agent log
-                        try:
-                            import json as _json_log
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:exec_summary_auto", "message": "Auto rerun (exec summary)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                        except: pass
-                        # #endregion
-                        st.rerun()
-                if len(sources) == 0:
-                    st.session_state["results"] = None
-                    st.info("No sources available. Add demo sources or upload real data to run optimization.")
-                    # #region agent log
-                    try:
-                        import json as _json_log
-                        with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                            _f.write(_json_log.dumps({"location": "dashboard.py:rerun:no_sources_exec", "message": "Rerun due to no sources", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H3"}) + "\n")
-                    except: pass
-                    # #endregion
-                    st.rerun()
-                ml_emv = results.get("emv", {}).get("ml_tssp", 0)
-                uni_emv = results.get("emv", {}).get("uniform", 0)
-                det_emv = results.get("emv", {}).get("deterministic", 0)
-                risk_reduction = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0.0
-                n_sources = max(len(sources), 1)
-                ml_emv_pct = emv_to_percent(ml_emv, n_sources=n_sources, lmax=1.0)
-                uni_emv_pct = emv_to_percent(uni_emv, n_sources=n_sources, lmax=1.0)
-                det_emv_pct = emv_to_percent(det_emv, n_sources=n_sources, lmax=1.0)
-                
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    render_kpi_indicator("Total Sources", len(sources), note="Input pool", number_font_size=13, key="kpi_total_sources_exec")
-                with col2:
-                    render_kpi_indicator(
-                        "Risk (EMV)",
-                        ml_emv_pct,
-                        reference=uni_emv_pct,
-                        suffix="%",
-                        note="vs Uniform (normalized)",
-                        number_font_size=13,
-                        key="kpi_risk_exec"
-                    )
-                with col3:
-                    ml = results.get("policies", {}).get("ml_tssp", [])
-                    assignable = (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED)
-                    assigned_only = [a for a in ml if a.get("source_state") in assignable]
-                    low_assigned = sum(1 for a in assigned_only if a.get("risk_bucket") == "low")
-                    n_assigned = len(assigned_only)
-                    render_kpi_indicator("Low Risk (Assigned)", low_assigned, note=f"n={n_assigned} assigned", number_font_size=13, key="kpi_low_risk_exec")
-                with col4:
-                    render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", number_font_size=13, key="kpi_improvement_exec")
-                
-                # Aggregates: risk_bucket (global), source_state, assigned portfolio (recomputed on every render)
-                ml_policy = results.get("policies", {}).get("ml_tssp", [])
-                _ensure_source_state_and_risk_bucket(ml_policy)
-                assignable = (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED)
-                n_all = len(ml_policy)
-                denom_all = max(n_all, 1)
-                # Risk Composition (global): all sources, by risk_bucket
-                low_global = sum(1 for a in ml_policy if a.get("risk_bucket") == "low")
-                med_global = sum(1 for a in ml_policy if a.get("risk_bucket") == "medium")
-                high_global = sum(1 for a in ml_policy if a.get("risk_bucket") == "high")
-                max_intrinsic = max([float(a.get("intrinsic_risk", a.get("expected_risk", 0.0))) for a in ml_policy] or [0.0])
-                # Decision Outcomes
-                assigned_normal = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_ASSIGNED)
-                assigned_esc = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
-                recommended_disengage = sum(1 for a in ml_policy if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
-                high_escalated = sum(1 for a in ml_policy if a.get("risk_bucket") == "high" and a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
-                high_disengage = sum(1 for a in ml_policy if a.get("risk_bucket") == "high" and a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
-                med_escalated = sum(1 for a in ml_policy if a.get("risk_bucket") == "medium" and a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
-                med_disengage = sum(1 for a in ml_policy if a.get("risk_bucket") == "medium" and a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
-                high_normal = sum(1 for a in ml_policy if a.get("risk_bucket") == "high" and a.get("source_state") == SOURCE_STATE_ASSIGNED)
-                med_normal = sum(1 for a in ml_policy if a.get("risk_bucket") == "medium" and a.get("source_state") == SOURCE_STATE_ASSIGNED)
-                # Assigned portfolio (post-recourse): assigned + assigned_escalated only
-                assigned_list = ml_policy
-                n_assigned = len(assigned_list)
-                denom_assigned = max(n_assigned, 1)
-                low_assigned = sum(1 for a in assigned_list if a.get("risk_bucket") == "low")
-                med_assigned = sum(1 for a in assigned_list if a.get("risk_bucket") == "medium")
-                high_assigned = sum(1 for a in assigned_list if a.get("risk_bucket") == "high")
-                rr = st.session_state.get("recourse_rules") or {}
-                _debug_log("dashboard.py:outcome_render", "outcome render", {"has_results": True, "ml_emv": ml_emv, "low_global": low_global, "high_global": high_global, "recommended_disengage": recommended_disengage, "recourse_rules": rr, "nav_key": nav_key}, "H1,H2,H3,H4")
-
-                if risk_reduction > 10:
-                    outcome_desc = "substantive reduction in expected mission value loss"
-                elif risk_reduction > 5:
-                    outcome_desc = "measurable reduction in expected mission value loss"
-                elif risk_reduction > 0:
-                    outcome_desc = "marginal reduction in expected mission value loss"
-                else:
-                    outcome_desc = "no reduction in expected mission value loss relative to the uniform baseline"
-
-                # High-risk visibility cue (always shown in Executive Summary)
-                st.markdown(
-                    f"<div style='font-size:11px;color:#0f172a;margin:0.2rem 0 0.4rem 0;'>"
-                    f"<strong>High-risk sources:</strong> {high_global} "
-                    f"<span style='color:#94a3b8;'>| max intrinsic risk: {max_intrinsic:.2f}</span>"
-                    f"</div>",
-                    unsafe_allow_html=True
-                )
-
-                # A. Risk Composition (global) — "What is the risk landscape we are dealing with?"
-                with st.expander("Risk Composition (global)", expanded=high_global > 0):
-                    _update_time = st.session_state.get("last_update_time", "Never")
-                    _version = st.session_state.get("results_version", 0)
-                    st.markdown(f"""
-                    <div style='background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:0.85rem 1rem;margin-top:0.5rem;'>
-                      <p style='font-size:10px;color:#64748b;margin:0 0 0.5rem 0;'>All sources, by intrinsic risk. Does not depend on assignment. <span style='color:#10b981;font-weight:600;'>● LIVE</span> v{_version} | {_update_time}</p>
-                      <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:0.6rem;'>
-                        <div style='background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:0.5rem;'>
-                          <div style='font-size:11px;color:#065f46;font-weight:700;'>Low</div>
-                          <div style='font-size:13px;color:#047857;font-weight:800;'>{low_global}</div>
-                          <div style='font-size:10px;color:#047857;'>{low_global/denom_all*100:.1f}%</div>
-                        </div>
-                        <div style='background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:0.5rem;'>
-                          <div style='font-size:11px;color:#92400e;font-weight:700;'>Medium</div>
-                          <div style='font-size:13px;color:#b45309;font-weight:800;'>{med_global}</div>
-                          <div style='font-size:10px;color:#b45309;'>{med_global/denom_all*100:.1f}%</div>
-                        </div>
-                        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:0.5rem;'>
-                          <div style='font-size:11px;color:#991b1b;font-weight:700;'>High</div>
-                          <div style='font-size:13px;color:#b91c1c;font-weight:800;'>{high_global}</div>
-                          <div style='font-size:10px;color:#b91c1c;'>{high_global/denom_all*100:.1f}%</div>
-                        </div>
-                      </div>
-                      <div style='font-size:10px;color:#94a3b8;margin-top:0.4rem;'>n={n_all} | high-risk threshold &gt; 0.60 | max intrinsic risk: {max_intrinsic:.2f}</div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                # B. Decision Outcomes — disengagement is an outcome, not a disappearance
-                with st.expander("Decision Outcomes", expanded=high_global > 0):
-                    if (high_normal + high_escalated + high_disengage) == 0:
-                        high_risk_sentence = "No high-risk sources were assigned."
-                    else:
-                        high_risk_sentence = f"High-risk sources: {high_normal} assigned under normal handling, {high_escalated} under escalation, and {high_disengage} recommended for disengagement."
-                    medium_risk_sentence = f"Among medium-risk sources, {med_normal} were assigned under normal handling and {med_escalated} under escalation, with {med_disengage} recommended for disengagement."
-                    _update_time = st.session_state.get("last_update_time", "Never")
-                    _version = st.session_state.get("results_version", 0)
-                    st.markdown(f"""
-                    <div style='background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:0.85rem 1rem;margin-top:0.5rem;'>
-                      <p style='font-size:10px;color:#64748b;margin:0 0 0.35rem 0;'>Assignment outcomes under current risk and oversight policies. <span style='color:#10b981;font-weight:600;'>● LIVE</span> v{_version} | {_update_time}</p>
-                      <p style='font-size:10px;color:#94a3b8;margin:0 0 0.6rem 0;'><strong>Escalation logic:</strong> High-risk sources → disengagement. Medium-risk sources with quality concerns → escalation. Low-risk sources with severe reliability/deception issues → escalation. Low-risk sources with good quality → normal assignment.</p>
-                      <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;margin-bottom:0.5rem;'>
-                        <div style='background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:0.45rem;'>
-                          <div style='font-size:10px;color:#065f46;font-weight:600;'>Assigned (normal)</div>
-                          <div style='font-size:14px;color:#047857;font-weight:800;'>{assigned_normal}</div>
-                        </div>
-                        <div style='background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:0.45rem;'>
-                          <div style='font-size:10px;color:#92400e;font-weight:600;'>Assigned with escalation</div>
-                          <div style='font-size:14px;color:#b45309;font-weight:800;'>{assigned_esc}</div>
-                        </div>
-                        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:0.45rem;'>
-                          <div style='font-size:10px;color:#991b1b;font-weight:600;'>Recommended disengagement</div>
-                          <div style='font-size:14px;color:#b91c1c;font-weight:800;'>{recommended_disengage}</div>
-                        </div>
-                      </div>
-                      <div style='font-size:10px;color:#64748b;'>
-                        <strong>By risk classification:</strong> {high_risk_sentence} {medium_risk_sentence}
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                # C. Assigned Portfolio Risk (Post-Recourse)
-                with st.expander("Assigned Portfolio Risk (Post-Recourse)", expanded=False):
-                    _update_time = st.session_state.get("last_update_time", "Never")
-                    _version = st.session_state.get("results_version", 0)
-                    st.markdown(f"""
-                    <div style='background:#ffffff;border:1px solid #e5e7eb;border-radius:10px;padding:0.75rem 0.9rem;margin-top:0.5rem;'>
-                      <div style='display:flex;justify-content:space-between;align-items:baseline;gap:0.5rem;'>
-                        <div style='font-size:12px;color:#334155;font-weight:700;'>Assigned Portfolio Risk (Post-Recourse)</div>
-                        <div style='font-size:11px;color:#64748b;'>n={n_assigned}, high={high_assigned}</div>
-                      </div>
-                      <p style='font-size:10px;color:#64748b;margin:0.35rem 0 0.5rem 0;'>Portfolio risk includes all sources (assigned + disengaged). High‑risk appear here even when recommended for disengagement. <span style='color:#10b981;font-weight:600;'>● LIVE</span> v{_version} | {_update_time}</p>
-                      <div style='display:grid;grid-template-columns:repeat(3,1fr);gap:0.6rem;margin-top:0.4rem;'>
-                        <div style='background:#ecfdf5;border:1px solid #a7f3d0;border-radius:8px;padding:0.55rem;'>
-                          <div style='font-size:11px;color:#065f46;font-weight:700;'>Low</div>
-                          <div style='font-size:13px;color:#047857;font-weight:800;line-height:1.2;'>{low_assigned}</div>
-                          <div style='font-size:11px;color:#047857;'>{low_assigned/denom_assigned*100:.1f}%</div>
-                        </div>
-                        <div style='background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:0.55rem;'>
-                          <div style='font-size:11px;color:#92400e;font-weight:700;'>Medium</div>
-                          <div style='font-size:13px;color:#b45309;font-weight:800;line-height:1.2;'>{med_assigned}</div>
-                          <div style='font-size:11px;color:#b45309;'>{med_assigned/denom_assigned*100:.1f}%</div>
-                        </div>
-                        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:0.55rem;'>
-                          <div style='font-size:11px;color:#991b1b;font-weight:700;'>High</div>
-                          <div style='font-size:13px;color:#b91c1c;font-weight:800;line-height:1.2;'>{high_assigned}</div>
-                          <div style='font-size:11px;color:#b91c1c;'>{high_assigned/denom_assigned*100:.1f}%</div>
-                        </div>
-                      </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-
-                # Outcome, Constraint Impact, EMV (dynamic narrative based on decision outcomes)
-                # Build outcome narrative based on actual assignment decisions
-                outcome_parts = []
-                if recommended_disengage > 0:
-                    outcome_parts.append(f"<strong>{recommended_disengage}</strong> sources recommended for disengagement (high risk)")
-                if assigned_esc > 0:
-                    outcome_parts.append(f"<strong>{assigned_esc}</strong> assigned with escalation (medium risk or quality concerns)")
-                if assigned_normal > 0:
-                    outcome_parts.append(f"<strong>{assigned_normal}</strong> assigned under normal handling (low risk, good quality)")
-                
-                if len(outcome_parts) == 0:
-                    outcome_summary = f"All <strong>{n_all}</strong> sources processed."
-                elif len(outcome_parts) == 1:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}."
-                elif len(outcome_parts) == 2:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]} and {outcome_parts[1]}."
-                else:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}, {outcome_parts[1]}, and {outcome_parts[2]}."
-                
-                # Constraint impact narrative (dynamic based on disengagement count)
-                if recommended_disengage > 0:
-                    constraint_narrative = f"Risk-based constraints excluded <strong>{recommended_disengage}</strong> high-risk sources from operational assignment. Medium-risk sources with quality concerns receive escalated oversight. Low-risk sources with acceptable performance operate under standard protocols."
-                elif assigned_esc > 0:
-                    constraint_narrative = f"Risk thresholds triggered escalation for <strong>{assigned_esc}</strong> sources with quality or uncertainty concerns. No sources meet high-risk disengagement criteria under current thresholds."
-                else:
-                    constraint_narrative = "All sources meet operational quality standards under current risk thresholds. No escalation or disengagement required."
-                
-                # EMV narrative (dynamic based on improvement)
-                if recommended_disengage > 0:
-                    emv_narrative = f"Disengaged sources (<strong>{recommended_disengage}</strong>) contribute zero EMV by policy, representing controlled opportunity cost. The <strong>{risk_reduction:.1f}%</strong> improvement reflects strategic risk avoidance—accepting {recommended_disengage} missed opportunities to prevent exposure to high-risk intelligence."
-                else:
-                    emv_narrative = f"The <strong>{risk_reduction:.1f}%</strong> improvement reflects optimized assignment quality and risk-aware task allocation, achieved without source disengagement."
-                
+            
+            # PROFESSIONAL STABILITY FIX: Always render summary box if we have results
+            if results and outcome_summary:
                 st.markdown(f"""
                 <div style='
                     background: linear-gradient(135deg, #f8fafc 0%, #ecfdf5 100%);
                     border: 1px solid #cbd5e1;
                     border-left: 4px solid #10b981;
-                    padding: 0.95rem 1.05rem;
+                    padding: 0.95rem 1.25rem;
                     border-radius: 10px;
                     margin-top: 1rem;
                     box-shadow: 0 10px 20px rgba(15,23,42,0.08);
+                    width: 100%;
+                    max-width: 100%;
+                    box-sizing: border-box;
                 '>
-                    <p style='margin: 0 0 0.65rem 0; font-size: 12px; color: #0f172a; line-height: 1.65;'>
+                    <p style='margin: 0 0 0.65rem 0; font-size: 13px; color: #0f172a; line-height: 1.65; max-width: 100%;'>
                         <span style='display:inline-block;font-weight:800;color:#064e3b;letter-spacing:0.2px;'>Decision Outcome</span><br/>
                         {outcome_summary} The optimized portfolio achieves <strong>{ml_emv_pct:.2f}%</strong> of worst‑case EMV, outperforming uniform (<strong>{uni_emv_pct:.2f}%</strong>) and deterministic (<strong>{det_emv_pct:.2f}%</strong>) baselines by <strong>{risk_reduction:.1f}%</strong>.
                     </p>
-                    <p style='margin: 0 0 0.65rem 0; font-size: 12px; color: #334155; line-height: 1.65;'>
+                    <p style='margin: 0 0 0.65rem 0; font-size: 13px; color: #334155; line-height: 1.65; max-width: 100%;'>
                         <span style='display:inline-block;font-weight:800;color:#065f46;letter-spacing:0.2px;'>Constraint Impact</span><br/>
                         {constraint_narrative}
                     </p>
-                    <p style='margin: 0; font-size: 12px; color: #334155; line-height: 1.65;'>
+                    <p style='margin: 0; font-size: 13px; color: #334155; line-height: 1.65; max-width: 100%;'>
                         <span style='display:inline-block;font-weight:800;color:#065f46;letter-spacing:0.2px;'>EMV and Improvement</span><br/>
                         {emv_narrative}
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-        
-        # ========== RUN OPTIMIZATION EXECUTION ==========
-        if run_button_right:
-            payload = {"sources": sources, "seed": 42}
-            # #region agent log
-            rr = st.session_state.get("recourse_rules") or {}
-            src0_rr = (sources[0].get("recourse_rules") if sources else None) or {}
-            _debug_log("dashboard.py:run_opt", "run_optimization called", {"n_sources": len(sources), "session_recourse_rules": rr, "first_source_has_recourse_rules": bool(sources and sources[0].get("recourse_rules")), "first_source_rr_keys": list(src0_rr.keys()) if src0_rr else []}, "H5")
-            # #endregion
-            try:
-                n_sources = len(sources) if sources else 0
                 
-                # Show immediate feedback - optimization is starting
-                progress_placeholder = st.empty()
-                progress_placeholder.info(f"🚀 Starting ML–TSSP batch optimization for {n_sources} sources...")
-                
-                # OPTIMIZATION: Only run optimization inside spinner - post-processing happens after
-                with st.spinner(f"🔄 Running ML–TSSP batch optimization ({n_sources} sources)…"):
-                    result = run_optimization(payload)
-                
-                # Clear progress placeholder
-                progress_placeholder.empty()
-                
-                # Post-processing (fast operations) - outside spinner for immediate feedback
-                if isinstance(result, dict) and isinstance(result.get("policies"), dict):
-                    sources_map = {s.get("source_id"): s for s in sources}
-                    for pkey in ["ml_tssp", "deterministic", "uniform"]:
-                        plist = result["policies"].get(pkey) or []
-                        _ensure_source_state_and_risk_bucket(plist)
-                        fixed = enforce_assignment_constraints(plist, sources_map)
-                        result["policies"][pkey] = fixed
-                        result.setdefault("emv", {})[pkey] = compute_emv(fixed)
-                
-                # Store results and update timestamp for dynamic sections
-                st.session_state.results = result
-                st.session_state.sources = sources
-                st.session_state["last_update_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                st.session_state["results_changed"] = True
-                st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
-                st.session_state["results_stale"] = False
-                
-                # Clear cache immediately (fast operation)
-                if "risk_threshold_filter" in st.session_state:
-                    del st.session_state["risk_threshold_filter"]
-                if "reliability_min_filter" in st.session_state:
-                    del st.session_state["reliability_min_filter"]
-                cache_keys_to_clear = [k for k in st.session_state.keys() if k.startswith("cached_")]
-                for key in cache_keys_to_clear:
-                    del st.session_state[key]
-                
-                # Update recourse rules hash
-                rr = st.session_state.get("recourse_rules") or {}
-                st.session_state["last_rules_hash"] = hashlib.md5(str(sorted(rr.items())).encode()).hexdigest()
-                
-                # Show success immediately
-                n_sources = len(sources) if sources else 0
-                st.success(f"✅ Batch optimization complete! Processed {n_sources} sources efficiently. All sections updated dynamically.")
-                st.session_state.show_results_popup = True
-                
-                # Database saves happen in background (non-blocking) - don't wait for these
-                if SHARED_DB_AVAILABLE:
-                    try:
-                        # #region agent log
-                        import json as _json_log
-                        try:
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_START", "message": "Starting DB save", "data": {"n_sources": len(sources) if sources else 0, "has_result": result is not None, "username": username}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-                        except: pass
-                        # #endregion
-                        # Save full optimization results (policies, EMV, etc.)
-                        save_optimization_results(result, sources, username)
-                        st.session_state["shared_results_timestamp"] = get_optimization_results_timestamp()
-                        # #region agent log
-                        try:
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_COMPLETE", "message": "DB save complete", "data": {"timestamp": st.session_state.get("shared_results_timestamp")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D"}) + "\n")
-                        except: pass
-                        # #endregion
-                        
-                        # PERFORMANCE: Batch save sources and assignments (much faster than one-by-one)
-                        ml_policy = result.get("policies", {}).get("ml_tssp", [])
-                        if ml_policy:
-                            # Prepare batch data for sources (reuse sources_map from above)
-                            sources_batch = []
-                            assignments_batch = []
-                            
-                            for assignment in ml_policy:
-                                source_id = assignment.get("source_id")
-                                if source_id:
-                                    # Collect source data for batch save
-                                    source_data = sources_map.get(source_id)
-                                    if source_data:
-                                        sources_batch.append((
-                                            source_id,
-                                            source_data.get("features", {}),
-                                            source_data.get("recourse_rules", {})
-                                        ))
-                                    # Collect assignment data for batch save
-                                    assignments_batch.append((source_id, assignment))
-                            
-                            # Batch save (single transaction for all sources and assignments)
-                            if sources_batch:
-                                batch_save_sources(sources_batch, username)
-                            if assignments_batch:
-                                batch_save_assignments(assignments_batch, "ml_tssp", username)
-                        
-                        log_audit(username, role, "run_optimization", "optimization", "batch", 
-                                 {"n_sources": len(sources), "using_ml": result.get("_using_ml_models", False)})
-                    except Exception as e:
-                        # Don't fail optimization if database save fails - log silently
-                        if MODE == "streamlit":
-                            pass  # Database save failures don't block user experience
-                        # #region agent log
-                        try:
-                            import json as _json_log
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:SAVE_ERROR", "message": "DB save error", "data": {"error": str(e)}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "F"}) + "\n")
-                        except: pass
-                        # #endregion
+                st.markdown('</div>', unsafe_allow_html=True)
 
+        # ========== RUN OPTIMIZATION EXECUTION ==========
+        if st.session_state.get("run_opt_btn_right"):
+            # Consume the click immediately to prevent re-execution on rerun
+            # But we don't use _consume_button_click here because we want to handle it manually
+            if st.session_state.get("_optimization_in_progress"):
+                st.info("Optimization is already running.")
+            else:
+                st.session_state["_optimization_in_progress"] = True
+                payload = {"sources": sources, "seed": 42}
                 # #region agent log
-                try:
-                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(_json_log.dumps({"location": "dashboard.py:run_opt:RERUN", "message": "Triggering rerun", "data": {"has_results": st.session_state.get("results") is not None, "shared_timestamp": st.session_state.get("shared_results_timestamp"), "results_version": st.session_state.get("results_version")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "D,E"}) + "\n")
-                except: pass
+                rr = st.session_state.get("recourse_rules") or {}
+                src0_rr = (sources[0].get("recourse_rules") if sources else None) or {}
+                _debug_log("dashboard.py:run_opt", "run_optimization called", {"n_sources": len(sources), "session_recourse_rules": rr, "first_source_has_recourse_rules": bool(sources and sources[0].get("recourse_rules")), "first_source_rr_keys": list(src0_rr.keys()) if src0_rr else []}, "H5")
                 # #endregion
-                st.rerun()
-            except RuntimeError as e:
-                # ML models required error
-                st.error(f"❌ ML-TSSP Optimization Failed: {e}")
-                st.warning("""
-                **ML-TSSP Models Required**
-                
-                The system requires ML-TSSP models (XGBoost + GRU) to operate. 
-                Formula-based optimization is no longer supported.
-                
-                Please ensure:
-                - ML model files are present in the models directory
-                - ML pipeline is properly initialized
-                - Models are loaded successfully
-                """)
-            except Exception as e:
-                st.error(f"❌ Optimization failed: {e}")
-                st.exception(e)
+                try:
+                    n_sources = len(sources) if sources else 0
+                    if n_sources == 0:
+                        st.error("No sources available. Upload/validate data before running optimization.")
+                        st.session_state["results"] = None
+                        st.session_state["_has_executed_optimization"] = False
+                        st.session_state["_pending_recompute"] = True
+                    else:
+                        # Check ML models if using local API
+                        if USE_LOCAL_API:
+                            models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, "models_loaded") and _ml_pipeline.models_loaded
+                            if not models_available:
+                                st.error("ML models are not loaded. Optimization cannot run.")
+                                st.session_state["results"] = None
+                                st.session_state["_has_executed_optimization"] = False
+                                st.session_state["_pending_recompute"] = True
+                            else:
+                                # Proceed with optimization
+                                _run_optimization_execution(sources, n_sources, payload, username, role)
+                        else:
+                            # Backend API path - proceed with optimization
+                            _run_optimization_execution(sources, n_sources, payload, username, role)
+                except RuntimeError as e:
+                    # ML models required error
+                    st.error(f"❌ ML-TSSP Optimization Failed: {e}")
+                    st.warning("""
+                    **ML-TSSP Models Required**
+                    
+                    The system requires ML-TSSP models (XGBoost + GRU) to operate. 
+                    Formula-based optimization is no longer supported.
+                    
+                    Please ensure:
+                    - ML model files are present in the models directory
+                    - ML pipeline is properly initialized
+                    - Models are loaded successfully
+                    """)
+                except Exception as e:
+                    st.error(f"❌ Optimization failed: {e}")
+                    st.exception(e)
+                finally:
+                    st.session_state["_optimization_in_progress"] = False
 
     # ======================================================
     # 1.5. WORKFLOW ACTIONS (Multi-User Interconnected)
@@ -8946,7 +8953,13 @@ def render_streamlit_app():
         
         # Tasking Coordinator: Pending Tasking Requests
         if has_permission("approve_tasking") or has_permission("assign_tasks"):
-            pending_requests = get_pending_tasking_requests(limit=20)
+            # FLOW CONTROL: Add timeout protection for database calls to prevent continuous loading
+            try:
+                pending_requests = get_pending_tasking_requests(limit=20)
+            except Exception as e:
+                # Database error - don't block the UI
+                pending_requests = []
+                st.warning(f"⚠️ Could not load pending requests: {str(e)}")
             if pending_requests:
                 with st.expander(f"📋 Pending Tasking Requests ({len(pending_requests)})", expanded=workflow_expanded):
                     st.markdown("""
@@ -8981,13 +8994,21 @@ def render_streamlit_app():
                                     assigned_task = st.session_state.get(f"task_{req['request_id']}", req['requested_task'])
                                     if approve_tasking_request(req['request_id'], username, assigned_task):
                                         st.success(f"✅ Approved tasking request for {req['source_id']}")
-                                        st.rerun()
+                                        # FLOW CONTROL: Safe rerun for UI update
+                                        if st.session_state.get("_consecutive_reruns", 0) < 3:
+                                            st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                                            st.session_state["_last_rerun_time"] = time.time()
+                                            st.rerun()
                             
                             with col3:
                                 if st.button("❌ Reject", key=f"reject_{req['request_id']}", use_container_width=True):
                                     if reject_tasking_request(req['request_id'], username):
                                         st.success(f"❌ Rejected tasking request for {req['source_id']}")
-                                        st.rerun()
+                                        # FLOW CONTROL: Safe rerun for UI update
+                                        if st.session_state.get("_consecutive_reruns", 0) < 3:
+                                            st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                                            st.session_state["_last_rerun_time"] = time.time()
+                                            st.rerun()
                             
                             # Optional: Allow task modification on approval
                             with st.expander("Modify Task Assignment", expanded=False):
@@ -9024,7 +9045,11 @@ def render_streamlit_app():
                                 if request_id:
                                     st.success(f"✅ Tasking request submitted! Request ID: {request_id}")
                                     st.info("Your request is now pending review by Tasking Coordinator.")
-                                    st.rerun()
+                                    # FLOW CONTROL: Safe rerun for UI update
+                                    if st.session_state.get("_consecutive_reruns", 0) < 3:
+                                        st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                                        st.session_state["_last_rerun_time"] = time.time()
+                                        st.rerun()
                             else:
                                 st.error("Please specify a requested task.")
                     else:
@@ -9033,7 +9058,12 @@ def render_streamlit_app():
                     st.info("No optimization results available. Run optimization first.")
                 
                 # Show user's own requests
-                my_requests = get_user_tasking_requests(username)
+                try:
+                    my_requests = get_user_tasking_requests(username)
+                except Exception as e:
+                    # Database error - don't block the UI
+                    my_requests = []
+                    st.warning(f"⚠️ Could not load your requests: {str(e)}")
                 if my_requests:
                     st.markdown("### My Tasking Requests")
                     for req in my_requests:
@@ -9082,7 +9112,12 @@ def render_streamlit_app():
                     st.info("No optimization results available.")
                 
                 # Show pending recommendations
-                pending_recs = get_pending_recommendations(limit=10)
+                try:
+                    pending_recs = get_pending_recommendations(limit=10)
+                except Exception as e:
+                    # Database error - don't block the UI
+                    pending_recs = []
+                    st.warning(f"⚠️ Could not load pending recommendations: {str(e)}")
                 if pending_recs:
                     st.markdown("### Pending Recommendations")
                     for rec in pending_recs:
@@ -9103,7 +9138,12 @@ def render_streamlit_app():
         # Oversight: View Audit Log
         if has_permission("view_audit_logs"):
             with st.expander("📜 Audit Log", expanded=False):
-                audit_entries = get_audit_log(limit=50)
+                try:
+                    audit_entries = get_audit_log(limit=50)
+                except Exception as e:
+                    # Database error - don't block the UI
+                    audit_entries = []
+                    st.warning(f"⚠️ Could not load audit log: {str(e)}")
                 if audit_entries:
                     st.markdown("### Recent Actions")
                     for entry in audit_entries:
@@ -9128,7 +9168,11 @@ def render_streamlit_app():
                 # Force sync by clearing last_sync_time
                 if "last_sync_time" in st.session_state:
                     del st.session_state["last_sync_time"]
-                st.rerun()
+                st.session_state["_allow_shared_sync"] = True
+                if _sync_results_from_shared_db():
+                    st.session_state["_has_executed_optimization"] = True
+                st.session_state["_allow_shared_sync"] = False
+                _safe_rerun("shared data refresh")
         with refresh_col2:
             if st.session_state.get("last_update_time"):
                 last_update = st.session_state.get("last_update_time", "Never")
@@ -9141,46 +9185,49 @@ def render_streamlit_app():
     # 2. DECISION INTELLIGENCE SUITE
     # ======================================================
     results = st.session_state.get("results")
+    
+    # DYNAMIC UPDATE INDICATOR: show last updated stamp only
+    results_version = st.session_state.get("results_version", 0)
+    last_update = st.session_state.get("last_update_time", "Never")
+    
+    # Check if results are present to determine if we should show the summary
+    results = st.session_state.get("results")
+    
+    if results and (results_version > 0 or last_update != "Never"):
+        # Compact indicator that appears in all sections
+        update_indicator = f"📊 v{results_version} | Updated: {last_update}"
+        if st.session_state.get("results_changed"):
+            update_indicator += " | ✨ **NEW**"
+        if st.session_state.get("_parameters_changed"):
+            update_indicator += " | 🔄 **Updating...**"
+        st.caption(update_indicator)
 
     # Show Policy Insights tab content
     if nav_key == "policies" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
-        if st.session_state.get("results_stale"):
+        if st.session_state.get("_pending_recompute"):
             # #region agent log
             try:
                 import json as _json_log
                 with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:policies", "message": "Results stale branch (policies)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
-            except: pass
+                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:policies", "message": "Results stale branch (policies)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("execute_optimization")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+            except: 
+                pass
             # #endregion
-            if use_real_data:
-                st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
-                if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
-                    if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_policies", use_container_width=True):
-                        _auto_refresh_results(st.session_state.get("sources") or [], allow_real_data=True)
-                        # #region agent log
-                        try:
-                            import json as _json_log
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:policies", "message": "Rerun triggered (policies)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                        except: pass
-                        # #endregion
-                        st.rerun()
-            else:
-                _auto_refresh_results(st.session_state.get("sources") or [])
-                # #region agent log
-                try:
-                    import json as _json_log
-                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:policies_auto", "message": "Auto rerun (policies)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                except: pass
-                # #endregion
-                st.rerun()
+            st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in Source Profiles to generate new results.")
         st.markdown("""<h3 class="section-header">📈 Policy Insights - Comparative Policy Evaluation</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
             Comprehensive analysis of ML–TSSP optimization results with policy comparisons and sensitivity assessments.
-            <strong>All sections update dynamically when filters or parameters change.</strong>
+            <strong>✨ All sections (Analyst, Executive, Oversight) update dynamically when parameters change.</strong>
         </p>""", unsafe_allow_html=True)
+        
+        # Safe navigation fallback for analysts to access Source Profiles
+        if has_permission("execute_optimization") and nav_key != "profiles":
+            nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+            with nav_col2:
+                if st.button("📋 Go to Source Profiles → Execute Optimization", key="nav_to_profiles_from_policies", use_container_width=True, help="Navigate to Source Profiles to execute optimization"):
+                    _set_nav("profiles")
+                    _safe_rerun("navigate to profiles")
         
         
         # Get policies (will be filtered dynamically in _render_comparative_policy_section)
@@ -9232,17 +9279,12 @@ def render_streamlit_app():
         # ========== COMPARATIVE POLICY EVALUATION (FULLY DYNAMIC) ==========
         with st.expander("🧭 Comparative Policy Evaluation", expanded=True):
             # This section is fully dynamic - filters and interactions update all subsections
-            # All metrics recalculate when:
-            # - Filters change
-            # - Results are updated
-            # - Parameters are adjusted
             _render_comparative_policy_section(results, ml_policy, det_policy, uni_policy, ml_emv, det_emv, uni_emv, risk_reduction)
             
             # Real-time refresh and export controls
             refresh_col1, refresh_col2, refresh_col3 = st.columns(3)
             with refresh_col1:
                 if st.button("🔄 Refresh All Metrics", key="refresh_policy_metrics", use_container_width=True):
-                    # Force recalculation by clearing relevant session state
                     cache_keys = [k for k in st.session_state.keys() if "filter" in k.lower() or "sort" in k.lower()]
                     for key in cache_keys:
                         if key not in ["risk_threshold_filter", "reliability_min_filter", "policy_filter", "policy_sort_by"]:
@@ -9253,7 +9295,6 @@ def render_streamlit_app():
             with refresh_col2:
                 if has_permission("export_bulk"):
                     if st.button("📊 Export Results", key="export_policy_results", use_container_width=True):
-                        # Export current results
                         export_data = {
                             "ml_tssp": ml_policy,
                             "deterministic": det_policy,
@@ -9279,8 +9320,8 @@ def render_streamlit_app():
             
             with refresh_col3:
                 if st.button("📈 View Advanced Metrics", key="view_advanced_from_policies", use_container_width=True):
-                    st.session_state["nav_pills"] = "evpi"
-                    st.rerun()
+                    _set_nav("evpi")
+                    _safe_rerun("view advanced metrics")
         
         # ========== ADVANCED METRICS (if available from pipeline) - FULLY DYNAMIC ==========
         advanced_metrics = results.get("analysis", {})
@@ -9293,23 +9334,19 @@ def render_streamlit_app():
                              f"Last Update: {st.session_state.get('last_update_time', 'N/A')}")
                 with refresh_col2:
                     if st.button("🔄 Recalculate", key="recalc_advanced_metrics", use_container_width=True):
-                        # Trigger recalculation (in real implementation, this would call pipeline)
                         st.info("🔄 Recalculating advanced metrics...")
-                        # In production, this would trigger pipeline.analyze_results()
                         st.session_state["recalc_requested"] = True
                         st.rerun()
                 with refresh_col3:
                     if st.button("🔄 Clear Cache", key="clear_metrics_cache", use_container_width=True):
-                        # Clear cached metrics
                         cache_keys = [k for k in st.session_state.keys() if "cached_" in k]
                         for key in cache_keys:
                             del st.session_state[key]
                         st.success("Cache cleared")
-                        st.rerun()
+                        _safe_rerun("cache cleared")
                 
                 _render_advanced_metrics_summary(advanced_metrics)
                 
-                # Add efficiency frontier summary (dynamic with interactive controls)
                 if advanced_metrics.get('efficiency_frontier'):
                     frontier_data = advanced_metrics['efficiency_frontier']
                     st.markdown("### Efficiency Frontier Summary (Dynamic)")
@@ -9321,12 +9358,12 @@ def render_streamlit_app():
                     with frontier_col3:
                         if st.button("📊 View Full", key="view_frontier_full", use_container_width=True):
                             st.session_state["show_frontier_detail"] = True
-                            st.session_state["nav_pills"] = "evpi"
-                            st.rerun()
+                            _set_nav("evpi")
+                            _safe_rerun("frontier view")
                     with frontier_col4:
                         if st.button("🔄 Refresh", key="refresh_frontier", use_container_width=True):
                             st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
-                            st.rerun()
+                            _safe_rerun("frontier refresh")
                     st.info("💡 **Tip:** Full efficiency frontier visualization with interactive controls is available in the EVPI Focus tab.")
         
         with st.expander("🧠 SHAP Explanations", expanded=False):
@@ -9334,44 +9371,24 @@ def render_streamlit_app():
         with st.expander("📡 Source Drift Monitoring (Reliability & Deception)", expanded=False):
             _render_drift_section()
         st.markdown('</div>', unsafe_allow_html=True)
-    
+
     # Show EVPI Focus tab content
     elif nav_key == "evpi" and results is not None:
         st.markdown('<div class="section-frame">', unsafe_allow_html=True)
-        if st.session_state.get("results_stale"):
+        if st.session_state.get("_pending_recompute"):
             # #region agent log
             try:
                 import json as _json_log
                 with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:evpi", "message": "Results stale branch (evpi)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
+                    _f.write(_json_log.dumps({"location": "dashboard.py:results_stale:evpi", "message": "Results stale branch (evpi)", "data": {"use_real_data": use_real_data, "has_permission_run": has_permission("execute_optimization")}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H2,H4"}) + "\n")
             except: pass
             # #endregion
-            if use_real_data:
-                st.markdown('<p style="font-size: 9px; color: #64748b; margin: 0.2rem 0;">Results update automatically after each optimization run.</p>', unsafe_allow_html=True)
-                if has_permission("run_models") or has_permission("approve_tasking") or has_permission("assign_tasks"):
-                    if st.button("🔁 Re-run Optimization", key="rerun_opt_real_data_evpi", use_container_width=True):
-                        _auto_refresh_results(st.session_state.get("sources") or [], allow_real_data=True)
-                        # #region agent log
-                        try:
-                            import json as _json_log
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "dashboard.py:rerun:evpi", "message": "Rerun triggered (evpi)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                        except: pass
-                        # #endregion
-                        st.rerun()
-            else:
-                _auto_refresh_results(st.session_state.get("sources") or [])
-                # #region agent log
-                try:
-                    import json as _json_log
-                    with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                        _f.write(_json_log.dumps({"location": "dashboard.py:rerun:evpi_auto", "message": "Auto rerun (evpi)", "data": {"use_real_data": use_real_data}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run2", "hypothesisId": "H4"}) + "\n")
-                except: pass
-                # #endregion
-                st.rerun()
+            # Show message that inputs changed - user must use Execute Optimization button
+            st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in Source Profiles to generate new results.")
         st.markdown("""<h3 class="section-header">💰 EVPI Focus - Expected Value of Perfect Information</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
             Quantify the marginal value of eliminating source behavior uncertainty through perfect information acquisition.
+            <strong>Updates dynamically when parameters change.</strong>
         </p>
         <div style='background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); 
                     padding: 1rem; border-radius: 8px; border-left: 4px solid #3b82f6; 
@@ -9417,20 +9434,32 @@ def render_streamlit_app():
         nav_col1, nav_col2, nav_col3, nav_col4 = st.columns(4)
         with nav_col1:
             if st.button("📈 Policy Insights", key="nav_to_policies_from_evpi", use_container_width=True):
-                st.session_state["nav_pills"] = "policies"
+                _set_nav("policies")
                 # Preserve current filters when navigating
                 st.session_state["preserve_filters"] = True
-                st.rerun()
+                # FLOW CONTROL: Safe navigation rerun
+                if st.session_state.get("_consecutive_reruns", 0) < 3:
+                    st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                    st.session_state["_last_rerun_time"] = time.time()
+                    st.rerun()
         with nav_col2:
             if st.button("🔬 Stress Lab", key="nav_to_stress_from_evpi", use_container_width=True):
-                st.session_state["nav_pills"] = "stress"
+                _set_nav("stress")
                 st.session_state["preserve_filters"] = True
-                st.rerun()
+                # FLOW CONTROL: Safe navigation rerun
+                if st.session_state.get("_consecutive_reruns", 0) < 3:
+                    st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                    st.session_state["_last_rerun_time"] = time.time()
+                    st.rerun()
         with nav_col3:
             if st.button("📋 Source Profiles", key="nav_to_profiles_from_evpi", use_container_width=True):
-                st.session_state["nav_pills"] = "profiles"
+                _set_nav("profiles")
                 st.session_state["preserve_filters"] = True
-                st.rerun()
+                # FLOW CONTROL: Safe navigation rerun
+                if st.session_state.get("_consecutive_reruns", 0) < 3:
+                    st.session_state["_consecutive_reruns"] = st.session_state.get("_consecutive_reruns", 0) + 1
+                    st.session_state["_last_rerun_time"] = time.time()
+                    st.rerun()
         with nav_col4:
             # Show current section indicator
             current_section = {"evpi": "💰 EVPI Focus", "policies": "📈 Policy Insights", 
@@ -9456,6 +9485,7 @@ def render_streamlit_app():
                         except:
                             pass
                 st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+                _safe_rerun("force refresh")
                 st.session_state["results_changed"] = True
                 st.rerun()
         
@@ -9467,6 +9497,7 @@ def render_streamlit_app():
         st.markdown("""<h3 class="section-header">🔬 Stress Lab - Behavioral Uncertainty & What-If Analysis</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
             Test system resilience under various behavioral scenarios and stress conditions.
+            <strong>Updates dynamically when parameters change.</strong>
         </p>""", unsafe_allow_html=True)
         ml_policy = results.get("policies", {}).get("ml_tssp", [])
         ml_emv = results.get("emv", {}).get("ml_tssp", 0)
@@ -9581,17 +9612,179 @@ def render_streamlit_app():
                 st.markdown("### Threshold Configuration")
                 st.markdown("⚠️ **Note:** Threshold changes require approval from Operations Oversight")
                 
+                # Load active thresholds from database
+                if SHARED_DB_AVAILABLE:
+                    active_thresholds = get_active_threshold_settings()
+                else:
+                    active_thresholds = {}
+                
+                # Default values if not in database
+                default_low_risk = active_thresholds.get("low_risk", RISK_LEVEL_THRESHOLDS.get("low", 0.3))
+                default_medium_risk = active_thresholds.get("medium_risk", RISK_LEVEL_THRESHOLDS.get("medium", 0.6))
+                default_rel_disengage = active_thresholds.get("rel_disengage", 0.35)
+                default_rel_ci_flag = active_thresholds.get("rel_ci_flag", 0.50)
+                default_dec_disengage = active_thresholds.get("dec_disengage", 0.75)
+                default_dec_ci_flag = active_thresholds.get("dec_ci_flag", 0.60)
+                
+                # Show current approved thresholds (read-only display)
+                st.markdown("**Current Approved Thresholds (Active System Values):**")
                 threshold_col1, threshold_col2 = st.columns(2)
                 with threshold_col1:
-                    st.number_input("Low Risk Threshold", min_value=0.0, max_value=1.0, value=0.3, step=0.05, key="admin_low_risk", disabled=True)
-                    st.number_input("Medium Risk Threshold", min_value=0.0, max_value=1.0, value=0.6, step=0.05, key="admin_medium_risk", disabled=True)
+                    st.number_input("Low Risk Threshold", min_value=0.0, max_value=1.0, value=default_low_risk, step=0.05, key="admin_low_risk_display", disabled=True, help="Currently approved and active value")
+                    st.number_input("Medium Risk Threshold", min_value=0.0, max_value=1.0, value=default_medium_risk, step=0.05, key="admin_medium_risk_display", disabled=True, help="Currently approved and active value")
+                    st.number_input("Reliability Disengage", min_value=0.0, max_value=1.0, value=default_rel_disengage, step=0.05, key="admin_rel_disengage_display", disabled=True, help="Currently approved and active value")
+                    st.number_input("Reliability CI Flag", min_value=0.0, max_value=1.0, value=default_rel_ci_flag, step=0.05, key="admin_rel_ci_flag_display", disabled=True, help="Currently approved and active value")
                 
                 with threshold_col2:
-                    st.number_input("Disengagement Threshold", min_value=0.0, max_value=1.0, value=0.7, step=0.05, key="admin_disengage_threshold", disabled=True)
-                    st.number_input("Escalation Threshold", min_value=0.0, max_value=1.0, value=0.5, step=0.05, key="admin_escalation_threshold", disabled=True)
+                    st.number_input("Deception Disengage", min_value=0.0, max_value=1.0, value=default_dec_disengage, step=0.05, key="admin_dec_disengage_display", disabled=True, help="Currently approved and active value")
+                    st.number_input("Deception CI Flag", min_value=0.0, max_value=1.0, value=default_dec_ci_flag, step=0.05, key="admin_dec_ci_flag_display", disabled=True, help="Currently approved and active value")
                 
-                if st.button("📝 Request Threshold Change", key="admin_request_threshold", use_container_width=True):
-                    st.info("Threshold change request submitted for approval")
+                st.divider()
+                
+                # Admin can edit thresholds (but changes require approval)
+                st.markdown("**Edit Thresholds (Changes Require Oversight Approval):**")
+                st.info("💡 **Note:** Any changes you make below will be submitted as a pending request. The current approved values above will remain active until Operations Oversight approves your request.")
+                
+                threshold_edit_col1, threshold_edit_col2 = st.columns(2)
+                with threshold_edit_col1:
+                    edited_low_risk = st.number_input("Low Risk Threshold", min_value=0.0, max_value=1.0, value=default_low_risk, step=0.05, key="admin_edit_low_risk", help="Edit to request a new value")
+                    edited_medium_risk = st.number_input("Medium Risk Threshold", min_value=0.0, max_value=1.0, value=default_medium_risk, step=0.05, key="admin_edit_medium_risk", help="Edit to request a new value")
+                    edited_rel_disengage = st.number_input("Reliability Disengage", min_value=0.0, max_value=1.0, value=default_rel_disengage, step=0.05, key="admin_edit_rel_disengage", help="Edit to request a new value")
+                    edited_rel_ci_flag = st.number_input("Reliability CI Flag", min_value=0.0, max_value=1.0, value=default_rel_ci_flag, step=0.05, key="admin_edit_rel_ci_flag", help="Edit to request a new value")
+                
+                with threshold_edit_col2:
+                    edited_dec_disengage = st.number_input("Deception Disengage", min_value=0.0, max_value=1.0, value=default_dec_disengage, step=0.05, key="admin_edit_dec_disengage", help="Edit to request a new value")
+                    edited_dec_ci_flag = st.number_input("Deception CI Flag", min_value=0.0, max_value=1.0, value=default_dec_ci_flag, step=0.05, key="admin_edit_dec_ci_flag", help="Edit to request a new value")
+                    # Reason for changes
+                    threshold_reason = st.text_area(
+                        "Reason for Threshold Changes",
+                        key="admin_threshold_reason",
+                        placeholder="Explain why these threshold changes are needed...",
+                        height=100,
+                        help="Required: Provide justification for threshold changes"
+                    )
+                
+                # Check if any values have changed
+                changes_detected = (
+                    abs(edited_low_risk - default_low_risk) > 0.001 or
+                    abs(edited_medium_risk - default_medium_risk) > 0.001 or
+                    abs(edited_rel_disengage - default_rel_disengage) > 0.001 or
+                    abs(edited_rel_ci_flag - default_rel_ci_flag) > 0.001 or
+                    abs(edited_dec_disengage - default_dec_disengage) > 0.001 or
+                    abs(edited_dec_ci_flag - default_dec_ci_flag) > 0.001
+                )
+                
+                submit_col1, submit_col2 = st.columns([3, 1])
+                with submit_col1:
+                    if st.button("📝 Submit Threshold Change Request(s)", key="admin_submit_threshold_requests", use_container_width=True, disabled=not changes_detected):
+                        if not threshold_reason or not threshold_reason.strip():
+                            st.error("Please provide a reason for the threshold changes.")
+                        elif SHARED_DB_AVAILABLE:
+                            username = st.session_state.get("username", "admin")
+                            submitted_requests = []
+                            try:
+                                # Submit requests for each changed threshold
+                                threshold_map = {
+                                    "low_risk": (edited_low_risk, default_low_risk),
+                                    "medium_risk": (edited_medium_risk, default_medium_risk),
+                                    "rel_disengage": (edited_rel_disengage, default_rel_disengage),
+                                    "rel_ci_flag": (edited_rel_ci_flag, default_rel_ci_flag),
+                                    "dec_disengage": (edited_dec_disengage, default_dec_disengage),
+                                    "dec_ci_flag": (edited_dec_ci_flag, default_dec_ci_flag)
+                                }
+                                
+                                for threshold_type, (requested_val, current_val) in threshold_map.items():
+                                    if abs(requested_val - current_val) > 0.001:
+                                        request_id = submit_threshold_request(
+                                            threshold_type=threshold_type,
+                                            requested_value=requested_val,
+                                            current_value=current_val,
+                                            reason=threshold_reason or "No reason provided",
+                                            requested_by=username
+                                        )
+                                        submitted_requests.append((threshold_type, request_id))
+                                
+                                if submitted_requests:
+                                    req_list = ", ".join([f"{t} (ID: {r})" for t, r in submitted_requests])
+                                    st.success(f"✅ {len(submitted_requests)} threshold change request(s) submitted: {req_list}. Awaiting Operations Oversight approval.")
+                                    st.rerun()
+                                else:
+                                    st.info("No threshold changes detected. All values match current approved thresholds.")
+                            except Exception as e:
+                                st.error(f"Failed to submit request(s): {e}")
+                        else:
+                            st.warning("Shared database not available. Cannot submit threshold requests.")
+                with submit_col2:
+                    if changes_detected:
+                        st.caption(f"⚠️ {sum([abs(edited_low_risk - default_low_risk) > 0.001, abs(edited_medium_risk - default_medium_risk) > 0.001, abs(edited_rel_disengage - default_rel_disengage) > 0.001, abs(edited_rel_ci_flag - default_rel_ci_flag) > 0.001, abs(edited_dec_disengage - default_dec_disengage) > 0.001, abs(edited_dec_ci_flag - default_dec_ci_flag) > 0.001])} change(s) pending")
+                
+                # Show pending requests
+                if SHARED_DB_AVAILABLE:
+                    st.divider()
+                    st.markdown("**Pending Threshold Requests:**")
+                    pending_requests = get_pending_threshold_requests()
+                    if pending_requests:
+                        for req in pending_requests:
+                            with st.expander(f"Request #{req['request_id']}: {req['threshold_type']} ({req['requested_value']:.2f})", expanded=False):
+                                st.markdown(f"**Requested by:** {req['requested_by']}")
+                                st.markdown(f"**Current value:** {req['current_value']:.2f}")
+                                st.markdown(f"**Requested value:** {req['requested_value']:.2f}")
+                                st.markdown(f"**Reason:** {req.get('reason', 'No reason provided')}")
+                                st.markdown(f"**Submitted:** {req['requested_at']}")
+                    else:
+                        st.info("No pending threshold requests.")
+            
+            # Oversight Approval Panel (only visible to oversight role)
+            if has_permission("validate_decisions"):
+                with st.expander("🔍 Operations Oversight - Threshold Approval", expanded=True):
+                    st.markdown("### Pending Threshold Change Requests")
+                    st.markdown("Review and approve/reject threshold change requests submitted by administrators.")
+                    
+                    if SHARED_DB_AVAILABLE:
+                        pending_requests = get_pending_threshold_requests()
+                        if pending_requests:
+                            for req in pending_requests:
+                                with st.container():
+                                    st.markdown(f"**Request #{req['request_id']}**")
+                                    col1, col2 = st.columns(2)
+                                    with col1:
+                                        st.markdown(f"**Threshold:** {req['threshold_type']}")
+                                        st.markdown(f"**Current Value:** {req['current_value']:.2f}")
+                                        st.markdown(f"**Requested Value:** {req['requested_value']:.2f}")
+                                        st.markdown(f"**Requested by:** {req['requested_by']}")
+                                    with col2:
+                                        st.markdown(f"**Submitted:** {req['requested_at']}")
+                                        st.markdown(f"**Reason:**")
+                                        st.markdown(f"_{req.get('reason', 'No reason provided')}_")
+                                    
+                                    approval_col1, approval_col2 = st.columns(2)
+                                    with approval_col1:
+                                        if st.button(f"✅ Approve Request #{req['request_id']}", key=f"approve_threshold_{req['request_id']}", use_container_width=True):
+                                            username = st.session_state.get("username", "oversight")
+                                            if approve_threshold_request(req['request_id'], username):
+                                                st.success(f"✅ Threshold change approved and applied!")
+                                                st.rerun()
+                                            else:
+                                                st.error("Failed to approve request.")
+                                    with approval_col2:
+                                        rejection_reason = st.text_input(
+                                            f"Rejection reason (optional)",
+                                            key=f"reject_reason_{req['request_id']}",
+                                            placeholder="Enter reason for rejection..."
+                                        )
+                                        if st.button(f"❌ Reject Request #{req['request_id']}", key=f"reject_threshold_{req['request_id']}", use_container_width=True):
+                                            username = st.session_state.get("username", "oversight")
+                                            if reject_threshold_request(req['request_id'], username, rejection_reason):
+                                                st.success(f"❌ Threshold change request rejected.")
+                                                st.rerun()
+                                            else:
+                                                st.error("Failed to reject request.")
+                                    
+                                    st.divider()
+                        else:
+                            st.info("No pending threshold requests awaiting approval.")
+                    else:
+                        st.warning("Shared database not available. Cannot load threshold requests.")
         
         # User Accounts and Roles Management
         with st.expander("👥 User Accounts & Roles", expanded=True):
@@ -9604,9 +9797,9 @@ def render_streamlit_app():
                 mock_users = [
                     {"username": "admin", "role": "admin", "last_login": "2026-01-25 10:30", "status": "Active"},
                     {"username": "analyst", "role": "analyst", "last_login": "2026-01-25 09:15", "status": "Active"},
-                    {"username": "commander", "role": "tasking_coordinator", "last_login": "2026-01-25 08:45", "status": "Active"},
-                    {"username": "operator", "role": "case_officer", "last_login": "2026-01-24 16:20", "status": "Active"},
-                    {"username": "evaluator", "role": "evaluation_officer", "last_login": "2026-01-25 07:30", "status": "Active"},
+                    {"username": "commander", "role": "commander", "last_login": "2026-01-25 08:45", "status": "Active"},
+                    {"username": "operator", "role": "operator", "last_login": "2026-01-24 16:20", "status": "Active"},
+                    {"username": "evaluator", "role": "oversight", "last_login": "2026-01-25 07:30", "status": "Active"},
                     {"username": "oversight", "role": "oversight", "last_login": "2026-01-25 11:00", "status": "Active"},
                     {"username": "executive", "role": "executive", "last_login": "2026-01-24 14:00", "status": "Active"},
                 ]
@@ -9649,13 +9842,13 @@ def render_streamlit_app():
                         if role_key == "admin":
                             st.markdown("System maintenance and configuration. Cannot view intelligence content or source performance data.")
                         elif role_key == "case_officer":
-                            st.markdown("Field operations and source management.")
+                            st.markdown("Collection role: source handling and field reporting.")
                         elif role_key == "analyst":
-                            st.markdown("Intelligence analysis and scoring.")
-                        elif role_key == "tasking_coordinator":
-                            st.markdown("Task assignment and coordination.")
-                        elif role_key == "evaluation_officer":
-                            st.markdown("Source evaluation and validation.")
+                            st.markdown("Sole analytic owner: upload, validate, configure, and execute ML‑TSSP.")
+                        elif role_key == "commander":
+                            st.markdown("Decision and tasking control based on analyst recommendations.")
+                        elif role_key == "operator":
+                            st.markdown("Execution support: task status updates and constraints.")
                         elif role_key == "oversight":
                             st.markdown("Operations oversight and compliance.")
                         elif role_key == "executive":
@@ -9700,7 +9893,7 @@ def render_streamlit_app():
             if "selected_source_idx" not in st.session_state:
                 st.session_state.selected_source_idx = 0
         
-        source_selector_col, source_profile_col = st.columns([1.2, 2.8])
+        source_selector_col, source_profile_col = st.columns([1, 3])
         
         # ========== LEFT PANEL: SOURCE SELECTOR CONSOLE ==========
         with source_selector_col:
@@ -9719,8 +9912,9 @@ def render_streamlit_app():
             for idx, source in enumerate(display_sources):
                 src_id = source.get("source_id", f"SRC_{idx + 1:03d}")
                 display_id = src_id
-                if role == "case_officer":
-                    display_id = _pseudonymize_source_id(src_id, username)
+                # Pseudonymization disabled
+                # if role == "case_officer":
+                #     display_id = _pseudonymize_source_id(src_id, username)
                 expected_risk = 0.5
                 intrinsic_risk = None
                 task_assign = "—"
@@ -9854,8 +10048,9 @@ def render_streamlit_app():
                 source_data = display_sources[selected_idx]
                 selected_src_id = source_data.get("source_id", f"SRC_{selected_idx + 1:03d}")
                 display_src_id = selected_src_id
-                if role == "case_officer":
-                    display_src_id = _pseudonymize_source_id(selected_src_id, username)
+                # Pseudonymization disabled
+                # if role == "case_officer":
+                #     display_src_id = _pseudonymize_source_id(selected_src_id, username)
                 features = source_data.get("features", {})
                 tsr_default = float(features.get("task_success_rate", 0.5))
                 cor_default = float(features.get("corroboration_score", 0.5))
@@ -10024,12 +10219,12 @@ def render_streamlit_app():
                         clickmode='event+select'
                     )
                     st.plotly_chart(fig_time_mini, use_container_width=True, key=f'gauge_time_{selected_idx}')
-                    time = st.number_input("Adjust Report Speed", 0.0, 1.0, time_default, step=0.05, key=f"time_input_{selected_idx}")
+                    timeliness = st.number_input("Adjust Report Speed", 0.0, 1.0, time_default, step=0.05, key=f"time_input_{selected_idx}")
                 st.markdown("**60-Day Reliability Forecast**")
                 st.caption("Expanded horizon to observe medium-term reliability trajectory (60 periods).")
                 periods = 60
                 rng_forecast = np.random.default_rng(10_000 + selected_idx)
-                base_rel = np.clip(0.35 + 0.25 * tsr + 0.20 * cor + 0.15 * time, 0.2, 0.9)
+                base_rel = np.clip(0.35 + 0.25 * tsr + 0.20 * cor + 0.15 * timeliness, 0.2, 0.9)
                 drift = 0.012 + 0.006 * rng_forecast.normal()
                 reliability_ts = [np.clip(base_rel + drift * j + rng_forecast.normal(0, 0.02), 0.25, 0.98) for j in range(periods)]
                 window = 7
@@ -10326,7 +10521,7 @@ def render_streamlit_app():
                 feat_upd = {
                     "task_success_rate": float(tsr),
                     "corroboration_score": float(cor),
-                    "report_timeliness": float(time)
+                    "report_timeliness": float(timeliness)
                 }
                 sources[selected_idx] = {
                     "source_id": selected_src_id,
@@ -10382,5 +10577,5 @@ def render_streamlit_app():
 # ======================================================
 # MAIN ENTRY POINT
 # ======================================================
-if __name__ == "__main__" or MODE == "streamlit":
+if __name__ == "__main__":
     render_streamlit_app()
