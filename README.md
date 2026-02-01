@@ -116,14 +116,28 @@ For more details, see the role and permission logic in `dashboard.py`.
 
 ## Getting Started
 
-1. **Local Deployment**:
+### Deployment Options
+
+1. **Local Streamlit Deployment**:
   ```bash
   pip install -r requirements.txt
   streamlit run streamlit_app.py
   ```
-2. **Streamlit Cloud**:
+
+2. **FastAPI Backend Deployment**:
+  ```bash
+  pip install -r requirements.txt
+  uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
+  ```
+  - Provides REST API endpoints for optimization
+  - Supports asynchronous job processing
+  - Includes health checks and job status monitoring
+  - API documentation available at `http://localhost:8000/docs`
+
+3. **Streamlit Cloud**:
   - Connect this repository and set the main file to `streamlit_app.py`.
-3. **Command-line Pipeline**:
+
+4. **Command-line Pipeline**:
   ```bash
   python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
   ```
@@ -381,4 +395,4 @@ Hybrid Machine Learning - Two-Stage Stochastic Programming Approach
 
 ## Contact
 
-[Your contact information]
+[lucas.wafula@strathmore.edu]
