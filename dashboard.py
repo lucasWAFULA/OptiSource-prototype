@@ -70,6 +70,18 @@ import io
 
 MODE = "streamlit"  # options: "streamlit", "api", "batch"
 
+
+def is_streamlit_cloud() -> bool:
+    """Detect if the app is running on Streamlit Cloud (no FastAPI/localhost)."""
+    return (
+        os.environ.get("STREAMLIT_CLOUD") == "1"
+        or os.environ.get("STREAMLIT_RUNTIME_ENV") == "cloud"
+        or "streamlit.app" in os.environ.get("HOSTNAME", "")
+    )
+
+
+RUNNING_ON_CLOUD = is_streamlit_cloud()
+
 # Operational limits (used by policy comparison, fallback optimization)
 MAX_SOURCES = 500
 MAX_TASKS = 20
@@ -168,10 +180,12 @@ if MODE == "streamlit":
     # Lazy imports - only load when needed
     @st.cache_resource
     def load_heavy_libraries():
-        """Lazy load TensorFlow and other heavy dependencies."""
+        """Lazy load TensorFlow and other heavy dependencies. Thread/GPU safe for Cloud + local."""
         try:
             import tensorflow as tf
-            tf.config.set_visible_devices([], 'GPU')  # Disable GPU
+            tf.config.set_visible_devices([], "GPU")
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+            tf.config.threading.set_inter_op_parallelism_threads(1)
             return tf
         except Exception as e:
             st.warning(f"TensorFlow not loaded: {e}")
@@ -184,10 +198,12 @@ else:
     st = DummyStreamlit()
     
     def load_heavy_libraries():
-        """Lazy load TensorFlow for non-streamlit modes."""
+        """Lazy load TensorFlow for non-streamlit modes. Thread/GPU safe."""
         try:
             import tensorflow as tf
-            tf.config.set_visible_devices([], 'GPU')
+            tf.config.set_visible_devices([], "GPU")
+            tf.config.threading.set_intra_op_parallelism_threads(1)
+            tf.config.threading.set_inter_op_parallelism_threads(1)
             return tf
         except Exception as e:
             print(f"TensorFlow not loaded: {e}")
@@ -1476,78 +1492,74 @@ def _init_streamlit():
     """, unsafe_allow_html=True)
 
 # ...existing API helper functions...
-# Import API functions with graceful fallback
-USE_LOCAL_API = False
-BACKEND_URL = "http://localhost:8000"
-
-
+# Import API functions with graceful fallback (available on both local and Cloud)
 try:
     from api import run_optimization as local_run_optimization
     from api import explain_source as local_explain_source
-    USE_LOCAL_API = True
-except ImportError as e:
+    _api_available = True
+except ImportError:
     local_run_optimization = None
     local_explain_source = None
-    USE_LOCAL_API = False
+    _api_available = False
+
+# Execution mode: FastAPI/HTTP only when running locally; Cloud must use in-process only
+USE_LOCAL_API = not RUNNING_ON_CLOUD and _api_available  # Optional FastAPI on local machine
+USE_INPROCESS_PIPELINE = True   # Always available (api.run_optimization with _ml_pipeline)
+BACKEND_URL = "http://localhost:8000"  # Used only when USE_LOCAL_API and HTTP fallback
 
 # Always define run_optimization for use in the UI
 def run_optimization(payload: dict):
     """
     Run ML-TSSP optimization (ML models required).
-    The system requires ML-TSSP models (XGBoost + GRU) to operate.
-    No formula-based fallback - ML models are mandatory.
+    Local: may use FastAPI if desired; Cloud: in-process only (no HTTP).
     All results are stored in session state for dynamic section updates.
     """
-    # Fast, efficient optimization with error handling and minimal overhead
-    models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
-    try:
-        print("[HEARTBEAT] Entered run_optimization")
-        if not models_available:
-            print("[HEARTBEAT] Models not available")
-            st.error("ML-TSSP models are required for optimization. Please ensure ML models are properly initialized before running optimization.")
-            return None
-        # Use local API (preferred for speed)
-        if USE_LOCAL_API and local_run_optimization:
-            print("[HEARTBEAT] Using local_run_optimization")
-            try:
-                print("[HEARTBEAT] Calling local_run_optimization (fast_mode=True)")
-                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
-                print("[HEARTBEAT] local_run_optimization (fast_mode=True) returned")
-            except TypeError:
-                print("[HEARTBEAT] Calling local_run_optimization (no fast_mode)")
-                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
-                print("[HEARTBEAT] local_run_optimization (no fast_mode) returned")
-            if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-                print("[HEARTBEAT] Invalid result from local_run_optimization")
-                st.error("ML-TSSP optimization returned invalid results. Please check ML model files and pipeline configuration.")
-                return None
-        else:
-            print("[HEARTBEAT] Using backend API for optimization")
-            try:
-                r = requests.post(f"{BACKEND_URL}/optimize", json=payload, timeout=3)
-                r.raise_for_status()
-                result = r.json()
-                print("[HEARTBEAT] Backend API returned result")
-                if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-                    print("[HEARTBEAT] Invalid result from backend API")
-                    st.error("Backend API returned invalid results. Please ensure backend has ML-TSSP models available.")
-                    return None
-            except requests.RequestException as e:
-                print(f"[HEARTBEAT] Backend API unavailable: {e}")
-                st.error(f"Backend API unavailable: {e}. ML-TSSP models are required. Please ensure backend is running with ML models.")
-                return None
-        print("[HEARTBEAT] Optimization result is valid, updating session state")
-        result["_using_ml_models"] = True
-        result["_using_fallback"] = False
-        if MODE == "streamlit":
-            st.session_state["last_optimization_result"] = result
-            st.session_state["last_optimization_time"] = datetime.now().isoformat()
-        print("[HEARTBEAT] Exiting run_optimization")
-        return result
-    except Exception as e:
-        print(f"[HEARTBEAT] Exception in run_optimization: {e}")
-        st.error(f"Optimization failed: {e}")
+    models_available = (
+        MODULAR_PIPELINE_AVAILABLE
+        and _ml_pipeline
+        and getattr(_ml_pipeline, "models_loaded", False)
+    )
+    if not models_available:
+        st.error("ML-TSSP models are required for optimization. Please ensure ML models are properly initialized before running optimization.")
         return None
+
+    # 1. LOCAL: try FastAPI/in-process (local_run_optimization) first when allowed
+    if USE_LOCAL_API and local_run_optimization:
+        try:
+            try:
+                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
+            except TypeError:
+                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+            if result and result.get("policies") and result.get("policies", {}).get("ml_tssp"):
+                result["_using_ml_models"] = True
+                result["_using_fallback"] = False
+                if MODE == "streamlit":
+                    st.session_state["last_optimization_result"] = result
+                    st.session_state["last_optimization_time"] = datetime.now().isoformat()
+                return result
+        except Exception as e:
+            st.warning(f"Local API failed, falling back to in-process: {e}")
+
+    # 2. IN-PROCESS (always works; required on Streamlit Cloud — no HTTP)
+    if not local_run_optimization:
+        st.error("Optimization module (api) not available. Ensure api.py is present and importable.")
+        return None
+    try:
+        result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+    except TypeError:
+        result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+    except Exception as e:
+        st.error(f"In-process optimization failed: {e}")
+        return None
+    if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
+        st.error("ML-TSSP optimization returned invalid results. Please check ML model files and pipeline configuration.")
+        return None
+    result["_using_ml_models"] = True
+    result["_using_fallback"] = False
+    if MODE == "streamlit":
+        st.session_state["last_optimization_result"] = result
+        st.session_state["last_optimization_time"] = datetime.now().isoformat()
+    return result
 
 def request_shap_explanation(source_payload: dict):
     if USE_LOCAL_API:
