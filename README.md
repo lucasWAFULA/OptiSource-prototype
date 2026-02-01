@@ -28,14 +28,14 @@ This application implements robust role-based access control (RBAC) to ensure th
 
 - User roles are assigned at login and stored in the session.
 - Each dashboard section checks permissions before displaying sensitive data or controls.
-- Navigation and actions are dynamically enabled/disabled based on the user’s role.
+- Navigation and actions are dynamically enabled/disabled based on the user's role.
 - Admins cannot view intelligence content or source performance data for security and compliance.
 
 For more details, see the role and permission logic in `dashboard.py`.
 
-# HUMINT Source Performance: ML-TSSP Framework
+# OptiSource: ML-TSSP Framework for HUMINT Source Performance Evaluation
 
-**HUMINT ML-TSSP** is a robust, modular platform for evaluating, optimizing, and visualizing Human Intelligence (HUMINT) source performance and task assignments. Leveraging advanced machine learning and a two-stage stochastic programming (TSSP) optimization model, the system provides actionable insights through an interactive Streamlit dashboard. Designed for reliability, explainability, and operational flexibility, it supports both production and research use cases.
+**OptiSource** is an advanced, modular platform designed for the evaluation, optimization, and visualization of Human Intelligence (HUMINT) source performance and task assignments. Utilizing state-of-the-art machine learning techniques and two-stage stochastic programming (TSSP) optimization, the system delivers actionable intelligence insights through an interactive Streamlit dashboard. Engineered for operational reliability, model explainability, and strategic flexibility, it serves both production environments and research applications.
 
 
 ## Key Features
