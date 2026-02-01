@@ -1,9 +1,32 @@
-## Role-Based Access Control
 
+## OptiSource: ML-TSSP System for HUMINT Source Optimization
+
+### Transforming HUMINT Management: Data-Driven Governance and Resource Optimization
+
+Modern intelligence operations demand rigorous, objective, and adaptive management of human sources. Agencies face persistent challenges—uncertainty, subjectivity, and resource constraints—that can undermine mission success. OptiSource redefines source performance management by leveraging advanced machine learning and two-stage stochastic programming, enabling agencies to replace intuition-based decisions with transparent, accountable, and evidence-driven processes. This approach ensures optimal resource allocation, reduces bias, and strengthens the integrity of intelligence governance.
+
+#### Addressing Core Challenges
+Intelligence operations demand precise evaluation of source reliability, deception risks, and task assignments to safeguard national interests. Subjective assessments can result in wasted resources, compromised missions, and delayed threat detection. By leveraging predictive analytics and optimization under uncertainty, OptiSource minimizes these risks, ensuring decisions are grounded in evidence rather than intuition.
+
+#### Innovative Solution Framework
+OptiSource employs a dual-stage approach:
+- **Predictive Modeling (Stage 1):** Utilizes machine learning algorithms like XGBoost and GRU to forecast source behaviors (cooperative, uncertain, coerced, deceptive) and performance metrics, drawing from historical data to provide objective reliability scores.
+- **Stochastic Optimization (Stage 2):** Applies two-stage stochastic programming to allocate tasks efficiently, accounting for uncertainties such as source attrition or environmental disruptions, while optimizing for mission coverage and risk mitigation.
+
+This framework supports governance by promoting transparency, auditability, and institutional resilience. It enables policy-makers to make informed decisions on resource deployment, enhances accountability through logged recommendations, and aligns operations with modern data analytics standards.
+
+#### Benefits for Governance and Policy
+- **Data-Driven Decision-Making:** Replaces opaque judgments with interpretable, reproducible insights, fostering trust and reducing bias in intelligence cycles.
+- **Resource Efficiency:** Optimizes task assignments to maximize operational value, minimizing waste and ensuring equitable distribution of limited assets across priorities like counter-terrorism and border security.
+- **Policy Alignment:** Strengthens national security policies by improving information quality, interagency coordination, and contingency planning, ultimately contributing to sustainable development goals focused on peace and strong institutions.
+- **Ethical AI Integration:** Incorporates explainable AI (e.g., SHAP) for human oversight, ensuring responsible use and continuous improvement through feedback loops.
+
+By institutionalizing these practices, OptiSource not only enhances operational effectiveness but also builds long-term resilience in intelligence governance, supporting proactive policy formulation and resource stewardship.
+
+#### Role-Based Access Control
 This application implements robust role-based access control (RBAC) to ensure that users only access features appropriate to their responsibilities within the intelligence cycle. Each user is assigned a role, which determines their permissions and accessible dashboard features.
 
-### User Roles
-
+**User Roles**
 - **Case Officer (Handler):** Manages assigned sources, submits tasking, updates field notes, flags risk, and recommends engagement.
 - **Intelligence Analyst:** Views reports, runs models, scores intelligence, and compares sources.
 - **Tasking Coordinator:** Approves tasking, assigns tasks, manages priorities, and views capabilities.
@@ -12,7 +35,7 @@ This application implements robust role-based access control (RBAC) to ensure th
 - **System Administrator:** Manages users, configures the system, and can export data in bulk. Cannot view intelligence content or source performance data.
 - **Executive / Strategic Viewer:** Views aggregated dashboards for high-level insights.
 
-### Permissions Matrix (Summary)
+**Permissions Matrix (Summary)**
 
 | Role                   | Key Permissions                                                                 |
 |------------------------|-------------------------------------------------------------------------------|
@@ -24,8 +47,7 @@ This application implements robust role-based access control (RBAC) to ensure th
 | Admin                  | manage_users, configure_system, export_bulk                                    |
 | Executive              | view_aggregated_dashboards                                                     |
 
-### How It Works
-
+**How It Works**
 - User roles are assigned at login and stored in the session.
 - Each dashboard section checks permissions before displaying sensitive data or controls.
 - Navigation and actions are dynamically enabled/disabled based on the user's role.
@@ -33,152 +55,113 @@ This application implements robust role-based access control (RBAC) to ensure th
 
 For more details, see the role and permission logic in `dashboard.py`.
 
-# OptiSource: ML-TSSP Framework for HUMINT Source Performance Evaluation
-
-**OptiSource** is an advanced, modular platform designed for the evaluation, optimization, and visualization of Human Intelligence (HUMINT) source performance and task assignments. Utilizing state-of-the-art machine learning techniques and two-stage stochastic programming (TSSP) optimization, the system delivers actionable intelligence insights through an interactive Streamlit dashboard. Engineered for operational reliability, model explainability, and strategic flexibility, it serves both production environments and research applications.
-
-
-## Key Features
-
+#### Key Features
 - **End-to-end pipeline**: Transforms raw or simulated HUMINT data into risk-aware, optimized task assignments.
 - **ML-driven risk assessment**: Predicts source behavior (cooperative, uncertain, coerced, deceptive), reliability, and deception using XGBoost and GRU models.
 - **TSSP optimization**: Assigns sources to tasks, balancing operational cost and risk under uncertainty, with recourse for adverse behaviors.
 - **Interactive dashboard**: Visualizes assignments, risk buckets, cost breakdowns, and supports scenario analysis with custom recourse policies.
 - **Failsafe fallback**: Remains fully functional using formula-based risk and behavior estimation if ML models are unavailable.
 
-
-## Core Pipeline Overview
-
+#### Core Pipeline Overview
 1. **Data Ingestion & Feature Engineering**
-  - Accepts CSV uploads or generates synthetic HUMINT datasets (15,000+ sources typical).
-  - Features include: task success rate, corroboration, timeliness, handler confidence, deception, CI flags, and more.
-
+   - Accepts CSV uploads or generates synthetic HUMINT datasets (15,000+ sources typical).
+   - Features include: task success rate, corroboration, timeliness, handler confidence, deception, CI flags, and more.
 2. **Machine Learning Models**
-  - **Behavior Classification**: XGBoost classifier predicts probabilities for each behavior class.
-  - **Reliability & Deception Regression**: GRU (deep learning) regressors output continuous reliability and deception scores (0-1).
-  - **Label encoding & scaling**: Ensures robust, production-ready inference.
-
+   - **Behavior Classification**: XGBoost classifier predicts probabilities for each behavior class.
+   - **Reliability & Deception Regression**: GRU (deep learning) regressors output continuous reliability and deception scores (0-1).
+   - **Label encoding & scaling**: Ensures robust, production-ready inference.
 3. **Two-Stage Stochastic Optimization (TSSP)**
-  - **Stage 1**: Assign sources to tasks to minimize expected cost, subject to operational constraints.
-  - **Stage 2 (Recourse)**: Adjusts for realized behaviors (e.g., disengage, flag, escalate) to minimize risk/cost after uncertainty is revealed.
-  - **Risk buckets**: Each source is categorized as low, medium, or high risk based on ML-predicted probabilities and recourse policy.
-
+   - **Stage 1**: Assign sources to tasks to minimize expected cost, subject to operational constraints.
+   - **Stage 2 (Recourse)**: Adjusts for realized behaviors (e.g., disengage, flag, escalate) to minimize risk/cost after uncertainty is revealed.
+   - **Risk buckets**: Each source is categorized as low, medium, or high risk based on ML-predicted probabilities and recourse policy.
 4. **Cost & Risk Analysis**
-  - Decomposes total cost by behavior class, source, and recourse action.
-  - Computes expected loss (EMV), risk-adjusted assignment scores, and visualizes cost/risk tradeoffs.
-
+   - Decomposes total cost by behavior class, source, and recourse action.
+   - Computes expected loss (EMV), risk-adjusted assignment scores, and visualizes cost/risk tradeoffs.
 5. **Interactive Dashboard (Streamlit)**
-  - Upload data, tune recourse policies, and run scenario analysis in real time.
-  - Visualizes assignments, risk buckets, KPIs, cost breakdowns, and model explanations (SHAP-style).
-  - Fully functional fallback mode if ML models are missing (formula-based risk/behavior estimation).
+   - Upload data, tune recourse policies, and run scenario analysis in real time.
+   - Visualizes assignments, risk buckets, KPIs, cost breakdowns, and model explanations (SHAP-style).
+   - Fully functional fallback mode if ML models are missing (formula-based risk/behavior estimation).
 
-
-## Additional Highlights
-
+#### Additional Highlights
 - **Production-ready**: Modular, robust, and cloud-deployable (Streamlit Cloud, GitHub Actions).
 - **Explainable**: SHAP-style feature attributions for model predictions.
 - **Customizable**: Recourse policies, risk thresholds, and solver options are user-tunable.
 - **Failsafe**: Formula-based fallback ensures dashboard and optimization always work, even if models are missing.
 - **Comprehensive outputs**: Assignment tables, risk/cost plots, downloadable reports, and more.
 
-
-## Example Workflow
-
+#### Example Workflow
 1. **Upload or generate HUMINT data**
 2. **ML models predict**: behavior probabilities, reliability, deception
 3. **TSSP optimizer assigns**: sources to tasks, minimizing expected loss
 4. **Recourse actions**: disengage, flag, escalate, or assign based on risk
 5. **Dashboard visualizes**: assignments, risk buckets, cost breakdowns, and allows scenario tuning
 
-
-## Model Details
-
+#### Model Details
 - **Behavior Classes**: Cooperative, Uncertain, Coerced, Deceptive
 - **ML Models**:
-  - XGBoost classifier for behavior prediction
-  - GRU regressors for reliability and deception (with scaler support)
+   - XGBoost classifier for behavior prediction
+   - GRU regressors for reliability and deception (with scaler support)
 - **Optimization**:
-  - Pyomo-based TSSP model
-  - Stage 1: Assignment, Stage 2: Recourse (risk mitigation)
-  - Risk buckets: Low (<0.3), Medium (0.3-0.6), High (>0.6)
+   - Pyomo-based TSSP model
+   - Stage 1: Assignment, Stage 2: Recourse (risk mitigation)
+   - Risk buckets: Low (<0.3), Medium (0.3-0.6), High (>0.6)
 - **Recourse Actions**: Disengage, flag for CI, escalate, assign
 - **Fallback**: Formula-based risk/behavior estimation if models are missing
 
-
-## Dashboard Highlights
-
+#### Dashboard Highlights
 - **KPI indicators**: Assignment quality, risk, and cost
 - **Assignment tables**: Per-source actions, risk, and task
 - **Risk/cost plots**: By behavior, source, and recourse action
 - **Scenario analysis**: Tune recourse thresholds and instantly see impact
 - **Health checks**: System status, model availability, and fallback mode
 
-
-## Getting Started
-
-### Deployment Options
-
+#### Getting Started
+**Deployment Options**
 1. **Local Streamlit Deployment**:
-  ```bash
-  pip install -r requirements.txt
-  streamlit run streamlit_app.py
-  ```
-
+   ```bash
+   pip install -r requirements.txt
+   streamlit run streamlit_app.py
+   ```
 2. **FastAPI Backend Deployment**:
-  ```bash
-  pip install -r requirements.txt
-  uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
-  ```
-  - Provides REST API endpoints for optimization
-  - Supports asynchronous job processing
-  - Includes health checks and job status monitoring
-  - API documentation available at `http://localhost:8000/docs`
-
+   ```bash
+   pip install -r requirements.txt
+   uvicorn fastapi_app:app --host 0.0.0.0 --port 8000
+   ```
+   - Provides REST API endpoints for optimization
+   - Supports asynchronous job processing
+   - Includes health checks and job status monitoring
+   - API documentation available at `http://localhost:8000/docs`
 3. **Streamlit Cloud**:
-  - Connect this repository and set the main file to `streamlit_app.py`.
-
+   - Connect this repository and set the main file to `streamlit_app.py`.
 4. **Command-line Pipeline**:
-  ```bash
-  python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
-  ```
+   ```bash
+   python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
+   ```
 
-
-## Outputs
-
+#### Outputs
 - `models/`: Trained ML models (`classification_model.pkl`, `reliability_model.keras`, `deception_model.keras`, scalers)
 - `output/`: Cost/risk plots, assignment tables, reports
 
-
-## References
-
+#### References
 - See `dashboard.py` for full dashboard logic and fallback details
 - See `src/pipeline.py` for ML-TSSP pipeline implementation
 
-
-## License
-
+#### License
 This project is licensed under the MIT License. See the LICENSE file for details.
 
-
-## Citation
-
+#### Citation
 If you use this code, please cite:
-
 HUMINT Source Performance: ML-TSSP Model  
 Hybrid Machine Learning - Two-Stage Stochastic Programming Approach
 
-
-## Contact
-
+#### Contact
 For questions or collaboration, please contact:
-
 **Lucas Wafula**  
 Graduate Student, MSc. Data Science & Analytics  
 Strathmore Institute of Mathematical Sciences  
 Email: lucas.wafula@strathmore.edu
 
-## Project Structure
-
+#### Project Structure
 ```
 .
 ├── src/
