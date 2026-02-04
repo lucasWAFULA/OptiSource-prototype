@@ -15,6 +15,10 @@ import plotly.express as px
 import requests
 import base64
 import streamlit as st
+
+# Ensure final_results is always initialized in session state
+if "final_results" not in st.session_state:
+    st.session_state["final_results"] = None
 # --- Ensure src/ is in the Python path for imports (for Streamlit Cloud compatibility) ---
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -27,7 +31,7 @@ try:
         get_pending_tasking_requests, get_pending_recommendations,
         get_user_tasking_requests, get_latest_assignments, get_audit_log, log_audit,
         save_optimization_results, load_latest_optimization_results, get_optimization_results_timestamp,
-        batch_save_sources, batch_save_assignments, DB_ENGINE, DB_CONNECTED,
+        DB_ENGINE, DB_CONNECTED,
         submit_threshold_request, approve_threshold_request, reject_threshold_request,
         get_active_threshold_settings, get_pending_threshold_requests, get_threshold_request_history
     )
@@ -51,8 +55,6 @@ except ImportError:
     def save_optimization_results(*args, **kwargs): return None
     def load_latest_optimization_results(*args, **kwargs): return None, None
     def get_optimization_results_timestamp(*args, **kwargs): return None
-    def batch_save_sources(*args, **kwargs): pass
-    def batch_save_assignments(*args, **kwargs): pass
     def submit_threshold_request(*args, **kwargs): return None
     def approve_threshold_request(*args, **kwargs): return False
     def reject_threshold_request(*args, **kwargs): return False
@@ -137,27 +139,7 @@ def _queue_shared_db_save(result: dict, sources: list, username: str, role: str,
         try:
             save_optimization_results(result, sources, username)
             _DB_SAVE_LAST_TS = get_optimization_results_timestamp()
-            sources_map_local = sources_map or {s.get("source_id"): s for s in sources}
-            ml_policy = result.get("policies", {}).get("ml_tssp", [])
-            if ml_policy:
-                sources_batch = []
-                assignments_batch = []
-                for assignment in ml_policy:
-                    source_id = assignment.get("source_id")
-                    if source_id:
-                        source_data = sources_map_local.get(source_id)
-                        if source_data:
-                            sources_batch.append((
-                                source_id,
-                                source_data.get("features", {}),
-                                source_data.get("recourse_rules", {})
-                            ))
-                        assignments_batch.append((source_id, assignment))
-                if sources_batch:
-                    batch_save_sources(sources_batch, username)
-                if assignments_batch:
-                    batch_save_assignments(assignments_batch, "ml_tssp", username)
-            log_audit(username, role, "run_optimization", "optimization", "batch",
+            log_audit(username, role, "run_optimization", "optimization", "save",
                      {"n_sources": len(sources), "using_ml": result.get("_using_ml_models", False)})
         except Exception as e:
             _debug_log("dashboard.py:shared_db_save", "DB save error", {"error": str(e)}, "H6")
@@ -882,6 +864,46 @@ def _apply_preset_mode():
     _mark_results_stale()
 
 def _run_optimization_execution(sources, n_sources, payload, username, role):
+
+    def build_final_results(optimizer_output):
+        """Builds a single source-of-truth results object for the dashboard."""
+        n_low = optimizer_output.get('n_low')
+        n_medium = optimizer_output.get('n_medium')
+        n_high = optimizer_output.get('n_high')
+        # Fallbacks for legacy keys
+        if n_low is None or n_medium is None or n_high is None:
+            ml_policy = optimizer_output.get('policies', {}).get('ml_tssp', [])
+            n_low = sum(1 for a in ml_policy if a.get('source_state') == SOURCE_STATE_ASSIGNED)
+            n_medium = sum(1 for a in ml_policy if a.get('source_state') == SOURCE_STATE_ASSIGNED_ESCALATED)
+            n_high = sum(1 for a in ml_policy if a.get('source_state') == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
+        emv_pct = optimizer_output.get('emv_pct')
+        improvement_pct = optimizer_output.get('improvement_pct')
+        if emv_pct is None or improvement_pct is None:
+            # Use improvement percentages from API if available
+            emv_data = optimizer_output.get('emv', {})
+            emv_pct = emv_data.get('improvement_over_deterministic')
+            improvement_pct = emv_data.get('improvement_over_uniform')
+            # Fallback to manual calculation if not available
+            if emv_pct is None or improvement_pct is None:
+                ml_emv = emv_data.get('ml_tssp', 0)
+                det_emv = emv_data.get('deterministic', 0)
+                uni_emv = emv_data.get('uniform', 0)
+                emv_pct = ((ml_emv - det_emv) / det_emv * 100) if det_emv else 0.0
+                improvement_pct = ((ml_emv - uni_emv) / uni_emv * 100) if uni_emv else 0.0
+        total_sources = len(optimizer_output.get('policies', {}).get('ml_tssp', []))
+        r = {
+            "total_sources": total_sources,
+            "disengaged": n_high,
+            "escalated": n_medium,
+            "normal": n_low,
+            "assigned_total": n_medium + n_low,
+            "emv_pct": emv_pct,
+            "improvement_pct": improvement_pct,
+        }
+        assert (
+            r["disengaged"] + r["escalated"] + r["normal"] == r["total_sources"]
+        ), "Result counts do not sum to total sources"
+        return r
     """Execute optimization and store results. Called from Execute Optimization button handler."""
     # Show immediate feedback - optimization is starting
     progress_placeholder = st.empty()
@@ -958,6 +980,8 @@ def _run_optimization_execution(sources, n_sources, payload, username, role):
     st.session_state["_pending_recompute"] = False
     st.session_state["_parameters_changed"] = False
     st.session_state["_has_executed_optimization"] = True
+    # Build and store final results object for dashboard
+    st.session_state["final_results"] = build_final_results(result)
     
     # Reset the button state manually to prevent re-execution
     # PROFESSIONAL STABILITY FIX: Only reset if the key exists and is actually True
@@ -1526,74 +1550,16 @@ def run_optimization(payload: dict):
     # 1. LOCAL: try FastAPI/in-process (local_run_optimization) first when allowed
     if USE_LOCAL_API and local_run_optimization:
         try:
-            try:
-                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
-            except TypeError:
-                result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
-            if result and result.get("policies") and result.get("policies", {}).get("ml_tssp"):
-                result["_using_ml_models"] = True
-                result["_using_fallback"] = False
-                if MODE == "streamlit":
-                    st.session_state["last_optimization_result"] = result
-                    st.session_state["last_optimization_time"] = datetime.now().isoformat()
-                return result
-        except Exception as e:
-            st.warning(f"Local API failed, falling back to in-process: {e}")
-
-    # 2. IN-PROCESS (always works; required on Streamlit Cloud — no HTTP)
-    if not local_run_optimization:
-        st.error("Optimization module (api) not available. Ensure api.py is present and importable.")
-        return None
-    try:
-        result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
-    except TypeError:
-        result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
-    except Exception as e:
-        st.error(f"In-process optimization failed: {e}")
-        return None
-    if not result or not result.get("policies") or not result.get("policies", {}).get("ml_tssp"):
-        st.error("ML-TSSP optimization returned invalid results. Please check ML model files and pipeline configuration.")
-        return None
-    result["_using_ml_models"] = True
-    result["_using_fallback"] = False
-    if MODE == "streamlit":
-        st.session_state["last_optimization_result"] = result
-        st.session_state["last_optimization_time"] = datetime.now().isoformat()
-    return result
-
-def request_shap_explanation(source_payload: dict):
-    if USE_LOCAL_API:
-        source_id = source_payload.get("source_id", "UNKNOWN")
-        features = source_payload.get("features", {})
-        
-        shap_values = {}
-        for behavior in BEHAVIOR_CLASSES:
-            behavior_shap = {}
-            
-            tsr = float(features.get("task_success_rate", 0.5))
-            cor = float(features.get("corroboration_score", 0.5))
-            timeliness = float(features.get("report_timeliness", 0.5))
-            
-            if behavior == "Cooperative":
-                behavior_shap["task_success_rate"] = tsr * 0.3
-                behavior_shap["corroboration_score"] = cor * 0.25
-                behavior_shap["report_timeliness"] = time * 0.15
-                behavior_shap["reliability_trend"] = (1 - tsr) * -0.05
-            elif behavior == "Uncertain":
-                behavior_shap["task_success_rate"] = (1 - tsr) * 0.2
-                behavior_shap["corroboration_score"] = (1 - cor) * 0.25
-                behavior_shap["report_timeliness"] = (1 - time) * 0.15
-                behavior_shap["reliability_trend"] = abs(0.5 - tsr) * 0.2
-            elif behavior == "Coerced":
-                behavior_shap["corroboration_score"] = (1 - cor) * 0.3
-                behavior_shap["task_success_rate"] = (1 - tsr) * 0.25
-                behavior_shap["report_timeliness"] = (1 - time) * 0.2
-                behavior_shap["consistency_volatility"] = abs(0.5 - cor) * 0.15
-            elif behavior == "Deceptive":
-                behavior_shap["corroboration_score"] = (1 - cor) * 0.35
-                behavior_shap["task_success_rate"] = abs(0.7 - tsr) * 0.25
-                behavior_shap["reliability_trend"] = (1 - tsr) * 0.2
-                behavior_shap["consistency_volatility"] = (1 - cor) * 0.2
+            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline, fast_mode=True)
+        except TypeError:
+            result = local_run_optimization(payload, ml_pipeline=_ml_pipeline)
+        if result and result.get("policies") and result.get("policies", {}).get("ml_tssp"):
+            result["_using_ml_models"] = True
+            result["_using_fallback"] = False
+            if MODE == "streamlit":
+                st.session_state["last_optimization_result"] = result
+                st.session_state["last_optimization_time"] = datetime.now().isoformat()
+            return result
             
             shap_values[behavior] = behavior_shap
         
@@ -1694,9 +1660,14 @@ def _check_system_health():
     health['details']['pyomo_available'] = PYOMO_AVAILABLE
     health['details']['cvxpy_available'] = CVXPY_AVAILABLE
     health['details']['shap_available'] = SHAP_AVAILABLE
-    health['details']['shared_db_engine'] = DB_ENGINE
-    health['details']['shared_db_connected'] = DB_CONNECTED
-    health['details']['shared_db_mode'] = "Local (SQLite)"
+    if SHARED_DB_AVAILABLE:
+        health['details']['shared_db_engine'] = DB_ENGINE
+        health['details']['shared_db_connected'] = DB_CONNECTED
+        health['details']['shared_db_mode'] = "Local (SQLite)"
+    else:
+        health['details']['shared_db_engine'] = "Not Available"
+        health['details']['shared_db_connected'] = False
+        health['details']['shared_db_mode'] = "Disabled"
     
     return health
 
@@ -1853,6 +1824,19 @@ def _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, tot
     return recommendation, box_type
 
 def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reduction):
+    # Expand the main content area to utilize extra right space
+    st.markdown(
+        """
+        <style>
+        .block-container {
+            max-width: 100vw !important;
+            padding-left: 2rem !important;
+            padding-right: 2rem !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
     # #region agent log
     import json as _json_log
     try:
@@ -1860,33 +1844,31 @@ def _render_strategic_decision_section(sources, ml_policy, ml_emv, risk_reductio
             _f.write(_json_log.dumps({"location": "dashboard.py:_render_strategic_decision_section:ENTRY", "message": "Section render start", "data": {"section": "strategic_decision", "has_sources": sources is not None, "has_ml_policy": ml_policy is not None}, "timestamp": int(__import__("time").time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "B"}) + "\n")
     except: pass
     # #endregion
-    st.markdown("""
-    <div class="insight-box">
-        <strong>📊 Optimization Complete!</strong> Key outcomes from the latest ML–TSSP run.
-    </div>
-    """, unsafe_allow_html=True)
-    low_risk_count = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "low"])
-    ml_coverage = len(set(a.get("task") for a in ml_policy))
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        render_kpi_indicator("Total Sources", len(sources), note="All assigned", key="kpi_total_sources_tab0")
-    with col2:
-        # Lower EMV is better
-        n_sources = max(len(sources), 1)
-        ml_emv_pct = emv_to_percent(ml_emv, n_sources=n_sources, lmax=1.0)
-        render_kpi_indicator(
-            "Risk (EMV)",
-            ml_emv_pct,
-            suffix="%",
-            note="of worst-case",
-            key="kpi_risk_tab0"
+    with st.container():
+        st.markdown(
+            '<div class="insight-box"><strong>📊 Optimization Complete!</strong> Key outcomes from the latest ML–TSSP run.</div>',
+            unsafe_allow_html=True
         )
-    with col3:
-        render_kpi_indicator("Low Risk", low_risk_count, key="kpi_low_risk_tab0")
-    with col4:
-        # risk_reduction is positive when ML-TSSP is better
-        render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", key="kpi_improvement_tab0")
-    st.divider()
+        low_risk_count = len([a for a in ml_policy if _get_risk_bucket_from_assignment(a) == "low"])
+        ml_coverage = len(set(a.get("task") for a in ml_policy))
+        col1, col2, col3, col4 = st.columns(4, gap="large")
+        with col1:
+            render_kpi_indicator("Total Sources", len(sources), note="All assigned", key="kpi_total_sources_tab0")
+        with col2:
+            n_sources = max(len(sources), 1)
+            ml_emv_pct = emv_to_percent(ml_emv, n_sources=n_sources, lmax=1.0)
+            render_kpi_indicator(
+                "Risk (EMV)",
+                ml_emv_pct,
+                suffix="%",
+                note="of worst-case",
+                key="kpi_risk_tab0"
+            )
+        with col3:
+            render_kpi_indicator("Low Risk", low_risk_count, key="kpi_low_risk_tab0")
+        with col4:
+            render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", key="kpi_improvement_tab0")
+        st.divider()
     # Generate dynamic recommendation
     recommendation, box_type = _generate_dynamic_recommendation(ml_emv, risk_reduction, low_risk_count, len(sources), ml_coverage)
     st.markdown(f"""
@@ -2134,6 +2116,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
         st.warning("⚠️ **Parameters Changed**: These metrics reflect previous settings. Re-run optimization to update.")
 
     # Calculate comparison metrics for executive summary
+    _ensure_source_state_and_risk_bucket(ml_policy)
     _ensure_source_state_and_risk_bucket(det_policy)
     _ensure_source_state_and_risk_bucket(uni_policy)
     
@@ -2151,9 +2134,9 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     
     # Executive takeaway with explicit comparisons
     if ml_recommended_disengage > 0:
-        takeaway = f"ML-TSSP achieves full task coverage, but flags {disengagement_pressure:.1f}% of the source pool for disengagement, indicating elevated long-term operational risk under present constraints. Compared to Deterministic and Uniform baselines, ML-TSSP reduces worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
+        takeaway = f"ML-TSSP achieves full task coverage, but flags {disengagement_pressure:.1f}% of the source pool for disengagement, indicating elevated long-term operational risk under present constraints. ML-TSSP demonstrates {ml_vs_det:.1f}% EMV improvement over deterministic baseline and {ml_vs_uni:.1f}% over uniform baseline, while reducing worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
     else:
-        takeaway = f"ML-TSSP maintains full coverage with no disengagement pressure, indicating sustainable operational posture under present constraints. Compared to Deterministic and Uniform baselines, ML-TSSP reduces worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
+        takeaway = f"ML-TSSP maintains full coverage with no disengagement pressure, indicating sustainable operational posture under present constraints. ML-TSSP demonstrates {ml_vs_det:.1f}% EMV improvement over deterministic baseline and {ml_vs_uni:.1f}% over uniform baseline, while reducing worst-case risk exposure by {ml_vs_det_cvar:.1f}% and {ml_vs_uni_cvar:.1f}% respectively."
     
     # Executive Policy Comparison Header with OSI KPI
     st.markdown(f"""
@@ -2580,7 +2563,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             <div style='background: rgba(255, 251, 235, 0.95); padding: 1rem; border-radius: 8px; 
                         border-left: 4px solid #f59e0b; margin-bottom: 1rem;'>
                 <p style='margin: 0; font-size: 13px; color: #92400e; line-height: 1.6;'>
-                    <strong>Stage 1-only baseline:</strong> Task assignment is based on fixed rules and moderate risk, with no use of machine learning or adaptive optimization. This model does <b>not</b> progress to Stage 2 or use any ML-based predictions.
+                    <strong>Rule-based baseline:</strong> Uses the same ML reliability/deception predictions as ML-TSSP but assumes fixed moderate risk (0.5) for all sources. No ML behavior predictions or Stage 2 optimization.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -2588,7 +2571,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             <div style='background: rgba(249, 250, 251, 0.95); padding: 1rem; border-radius: 8px; 
                         border-left: 4px solid #9ca3af; margin-bottom: 1rem;'>
                 <p style='margin: 0; font-size: 13px; color: #4b5563; line-height: 1.6;'>
-                    <strong>Does not use ML or Stage 2:</strong> This policy serves as a baseline comparator, operating exclusively at Stage 1 of the TSSP framework. It ignores behavioral uncertainty and adaptive learning, and does not forecast performance or optimize recourse.
+                    <strong>Stage 1 only:</strong> This baseline uses ML predictions for source quality but applies simple rule-based risk assessment without behavioral uncertainty modeling or adaptive optimization.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -2633,7 +2616,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             <div style='background: rgba(243, 244, 246, 0.95); padding: 1rem; border-radius: 8px; 
                         border-left: 4px solid #6b7280; margin-bottom: 1rem;'>
                 <p style='margin: 0; font-size: 13px; color: #374151; line-height: 1.6;'>
-                    <strong>Stage 1-only uniform allocation:</strong> Task assignment is based on equal allocation assumptions, with no use of intelligence, machine learning, or adaptive optimization. This model does <b>not</b> progress to Stage 2 or use any ML-based predictions.
+                    <strong>Equal-probability baseline:</strong> Uses the same ML reliability/deception predictions as ML-TSSP but assumes equal probability (25%) for all four behaviors. No ML behavior predictions or Stage 2 optimization.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -2641,7 +2624,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             <div style='background: rgba(240, 249, 255, 0.95); padding: 1rem; border-radius: 8px; 
                         border-left: 4px solid #6b7280; margin-bottom: 1rem;'>
                 <p style='margin: 0; font-size: 13px; color: #374151; line-height: 1.6;'>
-                    <strong>Does not use ML or Stage 2:</strong> This policy serves as a baseline comparator, operating exclusively at Stage 1 of the TSSP framework. It assumes equal likelihood for all behaviors, ignores all intelligence, and does not forecast performance or optimize recourse.
+                    <strong>Stage 1 only:</strong> This baseline uses ML predictions for source quality but assumes naive equal-probability behavior distribution without uncertainty modeling or adaptive optimization.
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -7142,1180 +7125,81 @@ def render_streamlit_app():
         
         # ========== SOURCE DATA INPUT SECTION ==========
         with st.expander("📥 SOURCE DATA INPUT", expanded=False):
-            # Initialize session state for input mode
-            if "input_mode" not in st.session_state:
-                st.session_state.input_mode = "Single Source"
-            if "custom_sources" not in st.session_state:
-                st.session_state.custom_sources = []
-            
-            # Tab/Mode selection
-            input_mode = st.radio(
-                "Input mode",
-                ["🔬 Single Source Test", "📂 CSV Upload & Filter", "📊 Batch Upload"],
-                key="input_mode_selector",
-                label_visibility="collapsed",
-                horizontal=True,
-                help="Single source, CSV with filter, or batch upload"
-            )
-            
-            st.markdown("<div style='margin: 0.8rem 0;'></div>", unsafe_allow_html=True)
-            
-            # ========== SINGLE SOURCE ENTRY MODE ==========
-            if input_mode == "🔬 Single Source Test":
-                st.markdown("""
-                <p style='font-size: 10px; color: #92400e; margin: 0 0 0.6rem 0; font-style: italic;'>
-                    Manual entry for testing and "what-if" scenarios
-                </p>
-                """, unsafe_allow_html=True)
-                
-                with st.form("single_source_form"):
-                    # Source ID at the top
-                    source_id = st.text_input(
-                        "Source ID",
-                        value=f"SRC_TEST_{len(st.session_state.custom_sources)+1:03d}",
-                        help="Unique identifier for the source"
-                    )
-                    
-                    st.markdown("<div style='margin: 0.4rem 0;'></div>", unsafe_allow_html=True)
-                    
-                    # Balanced 2-column layout for the 6 input features
-                    col1, col2 = st.columns(2)
-                    
-                    with col1:
-                        st.markdown("<p style='font-size: 10px; font-weight: 600; color: #1e40af; margin: 0 0 0.3rem 0;'>Core Performance Metrics</p>", unsafe_allow_html=True)
-                        
-                        task_success = st.slider(
-                            "Task Success Rate",
-                            0.0, 1.0, 0.0, 0.05,
-                            help="Historical success rate in completing assigned tasks"
-                        )
-                        
-                        corroboration = st.slider(
-                            "Corroboration Score",
-                            0.0, 1.0, 0.0, 0.05,
-                            help="Degree to which source reports are independently verified"
-                        )
-                        
-                        timeliness = st.slider(
-                            "Report Timeliness",
-                            0.0, 1.0, 0.0, 0.05,
-                            help="Consistency in delivering reports on time"
-                        )
-                    
-                    with col2:
-                        st.markdown("<p style='font-size: 10px; font-weight: 600; color: #1e40af; margin: 0 0 0.3rem 0;'>Risk & Confidence Indicators</p>", unsafe_allow_html=True)
-                        
-                        handler_conf = st.slider(
-                            "Handler Confidence",
-                            0.0, 1.0, 0.0, 0.05,
-                            help="Handler's confidence in the source based on experience"
-                        )
-                        
-                        deception = st.slider(
-                            "Deception Score",
-                            0.0, 1.0, 0.0, 0.05,
-                            help="Indicators of potential deception or manipulation"
-                        )
-                        
-                        ci_flag = st.selectbox(
-                            "CI Flag",
-                            [0, 1],
-                            index=0,
-                            format_func=lambda x: "No (0)" if x == 0 else "Yes (1)",
-                            help="Counterintelligence concern flag (0=No, 1=Yes)"
-                        )
-                    
-                    # Optional fields
-                    with st.expander("📝 Optional Fields"):
-                        behavior = st.selectbox(
-                            "Behavior Category",
-                            ["Unknown", "Cooperative", "Uncertain", "Coerced"],
-                            help="Behavioral classification of the source"
-                        )
-                        
-                        access = st.selectbox(
-                            "Access Level",
-                            ["Unknown", "Limited", "Moderate", "Extensive"],
-                            help="Source's access to target information"
-                        )
-                        
-                        notes = st.text_area(
-                            "Handler Notes",
-                            placeholder="Additional context or observations...",
-                            height=80
-                        )
-                    
-                    can_upload_eval = has_permission("upload_evaluation_data")
-                    col_submit, col_clear = st.columns(2)
-                    with col_submit:
-                        submit_single = st.form_submit_button(
-                            "▶ Validate Single Source",
-                            type="primary",
-                            use_container_width=True,
-                            disabled=not can_upload_eval
-                        )
-                    with col_clear:
-                        clear_results = st.form_submit_button("↺ Clear Results", use_container_width=True, disabled=not can_upload_eval)
-                
-                if clear_results:
-                    if "single_source_result" in st.session_state:
-                        del st.session_state.single_source_result
-                    _safe_rerun("clear single source results")
-                
-                if submit_single:
-                    # Build source data with all 6 input features
-                    source_data = {
-                        "source_id": source_id,
-                        "task_success_rate": task_success,
-                        "corroboration_score": corroboration,
-                        "report_timeliness": timeliness,
-                        "handler_confidence": handler_conf,
-                        "deception_score": deception,
-                        "ci_flag": ci_flag
-                    }
-                    
-                    if behavior != "Unknown":
-                        source_data["behavior_category"] = behavior
-                    if access != "Unknown":
-                        source_data["access_level"] = access
-                    if notes:
-                        source_data["handler_notes"] = notes
-                    
-                    # Validate
-                    clean_data, errors = _validate_source_schema(source_data)
-                    
-                    if errors:
-                        st.error("**Validation Errors:**")
-                        for err in errors:
-                            st.error(f"• {err}")
-                    else:
-                        # Store validated single source for later optimization run
-                        if "custom_sources_pool" not in st.session_state:
-                            st.session_state.custom_sources_pool = []
-                        custom_source = {
-                            "source_id": clean_data.get("source_id"),
-                            "features": {
-                                "task_success_rate": clean_data["task_success_rate"],
-                                "corroboration_score": clean_data["corroboration_score"],
-                                "report_timeliness": clean_data["report_timeliness"],
-                                "handler_confidence": clean_data["handler_confidence"],
-                                "deception_score": clean_data["deception_score"],
-                                "ci_flag": clean_data["ci_flag"],
-                            },
-                            "reliability_series": [],
-                        }
-                        existing_ids = [s.get("source_id") for s in st.session_state.custom_sources_pool]
-                        if custom_source["source_id"] not in existing_ids:
-                            st.session_state.custom_sources_pool.append(custom_source)
-                            st.session_state["_has_executed_optimization"] = False
-                            st.success("✅ Source validated and queued for optimization.")
-                            st.info("Run **Execute Optimization** to generate results.")
-                        else:
-                            st.warning("⚠️ Source already in the optimization pool.")
-                        if "single_source_result" in st.session_state:
-                            del st.session_state.single_source_result
-                
-                # Display results if available
-                if "single_source_result" in st.session_state:
-                    result = st.session_state.single_source_result
-                    
-                    st.markdown("""
-                    <div style='background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); 
-                                border-radius: 12px; padding: 1.2rem; margin: 1rem 0; 
-                                border-left: 5px solid #10b981; box-shadow: 0 2px 8px rgba(0,0,0,0.08);'>
-                        <h3 style='margin: 0; font-size: 12px; font-weight: 700; color: #047857;'>
-                            ✅ Source Analysis Complete
-                        </h3>
-                        <p style='margin: 0.3rem 0 0 0; font-size: 8px; color: #065f46; opacity: 0.9;'>
-                            ML-TSSP Pipeline • Real-time Decision Support
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    
-                    # Key Metrics Dashboard
-                    st.markdown("""
-                    <style>
-                    /* Metric card visual hierarchy */
-                    [data-testid="stMetricValue"] {
-                        font-size: 12px;
-                    }
-                    [data-testid="stMetricLabel"] {
-                        font-size: 8px;
-                    }
-                    /* Primary metric (Reliability) - stronger */
-                    div[data-testid="column"]:nth-child(1) [data-testid="stMetricLabel"] {
-                        font-weight: 600;
-                        color: #1e3a8a;
-                        font-size: 8px;
-                    }
-                    div[data-testid="column"]:nth-child(1) [data-testid="stMetricValue"] {
-                        font-weight: 700;
-                        font-size: 14px;
-                    }
-                    /* Secondary metrics - softer */
-                    div[data-testid="column"]:nth-child(2) [data-testid="stMetricLabel"],
-                    div[data-testid="column"]:nth-child(3) [data-testid="stMetricLabel"],
-                    div[data-testid="column"]:nth-child(4) [data-testid="stMetricLabel"] {
-                        font-weight: 400;
-                        color: #6b7280;
-                        font-size: 8px;
-                    }
-                    div[data-testid="column"]:nth-child(2) [data-testid="stMetricValue"],
-                    div[data-testid="column"]:nth-child(3) [data-testid="stMetricValue"],
-                    div[data-testid="column"]:nth-child(4) [data-testid="stMetricValue"] {
-                        font-weight: 500;
-                        font-size: 12px;
-                    }
-                    </style>
-                    """, unsafe_allow_html=True)
-                    
-                    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
-                    
-                    with metric_col1:
-                        rel_val = result.get('ml_reliability', 0.0)
-                        rel_delta = rel_val - 0.5
-                        st.metric(
-                            "Reliability", 
-                            f"{rel_val:.1%}",
-                            delta=f"{rel_delta:+.1%}",
-                            help="ML-estimated source reliability score"
-                        )
-                    
-                    with metric_col2:
-                        dec_val = result.get('deception_confidence', 0.0)
-                        dec_delta = dec_val - 0.5
-                        st.metric(
-                            "Deception Risk", 
-                            f"{dec_val:.1%}",
-                            delta=f"{dec_delta:+.1%}",
-                            delta_color="inverse",
-                            help="Estimated probability of deceptive reporting"
-                        )
-                    
-                    with metric_col3:
-                        decision = result.get('decision', 'unknown')
-                        decision_display = {
-                            'task': 'Task',
-                            'flag_and_task': 'Flag & Task',
-                            'flag_for_ci': 'CI Review',
-                            'disengage': 'Disengage'
-                        }.get(decision, 'Unknown')
-                        st.metric(
-                            "Decision", 
-                            decision_display,
-                            help="TSSP operational decision"
-                        )
-                    
-                    with metric_col4:
-                        tasks = result.get('tssp_allocation', [])
-                        task_count = len(tasks) if tasks else 0
-                        st.metric(
-                            "Tasks", 
-                            str(task_count),
-                            help=f"Assigned: {', '.join(tasks[:3])}..." if task_count > 3 else f"Assigned: {', '.join(tasks)}" if task_count > 0 else "No tasks assigned"
-                        )
-                    
-                    # Add to simulation button
-                    st.markdown("---")
-                    col_add, col_export = st.columns(2)
-                    with col_add:
-                        if st.button("➕ Add to Main Simulation", use_container_width=True, help="Add this source to the main simulation pool"):
-                            # Add to custom sources list
-                            if "custom_sources_pool" not in st.session_state:
-                                st.session_state.custom_sources_pool = []
-                            
-                            # Create source entry
-                            custom_source = {
-                                "source_id": result.get('source_id'),
-                                "features": result.get('features'),
-                                "ml_reliability": result.get('ml_reliability'),
-                                "deception_confidence": result.get('deception_confidence'),
-                                "decision": result.get('decision')
-                            }
-                            
-                            # Check if already exists
-                            existing_ids = [s.get('source_id') for s in st.session_state.custom_sources_pool]
-                            if custom_source['source_id'] not in existing_ids:
-                                st.session_state.custom_sources_pool.append(custom_source)
-                                st.success(f"✅ {custom_source['source_id']} added to simulation pool!")
-                                st.info(f"📊 Pool now contains {len(st.session_state.custom_sources_pool)} custom sources")
-                            else:
-                                st.warning("⚠️ Source already in simulation pool")
-                    
-                    with col_export:
-                        # Export single source as CSV
-                        export_df = pd.DataFrame([{
-                            "source_id": result.get('source_id'),
-                            "task_success_rate": result.get('features', {}).get('task_success_rate'),
-                            "corroboration_score": result.get('features', {}).get('corroboration_score'),
-                            "report_timeliness": result.get('features', {}).get('report_timeliness'),
-                            "ml_reliability": result.get('ml_reliability'),
-                            "deception_confidence": result.get('deception_confidence'),
-                            "decision": result.get('decision')
-                        }])
-                        csv = export_df.to_csv(index=False)
-                        st.download_button(
-                            label="📥 Export as CSV",
-                            data=csv,
-                            file_name=f"{result.get('source_id', 'source')}_result.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    
-                    # Enhanced detailed explanation
-                    with st.expander("🔍 Detailed Analysis & Insights", expanded=False):
-                        
-                        # Add custom CSS for calmer tabs
-                        st.markdown("""
-                        <style>
-                        /* Calmer tab styling */
-                        .stTabs [data-baseweb="tab-list"] {
-                            gap: 8px;
-                            border-bottom: 2px solid #e5e7eb;
-                            padding-bottom: 0;
-                        }
-                    .stTabs [data-baseweb="tab"] {
-                        background-color: #f9fafb;
-                        color: #6b7280;
-                        border-radius: 8px 8px 0 0;
-                        padding: 0.5rem 1rem;
-                        font-weight: 500;
-                        border: 1px solid #e5e7eb;
-                        border-bottom: none;
-                    }
-                    .stTabs [aria-selected="true"] {
-                        background-color: white;
-                        color: #1e3a8a;
-                        font-weight: 600;
-                        border-color: #e5e7eb;
-                        border-bottom: 2px solid white;
-                        margin-bottom: -2px;
-                    }
-                    </style>
-                    """, unsafe_allow_html=True)
-                    
-                    # Subtle divider before tabs
-                    st.markdown("<div style='margin: 1rem 0 1.5rem 0; border-top: 1px solid #e5e7eb;'></div>", unsafe_allow_html=True)
-                    
-                    # Tab-based navigation for cleaner organization
-                    tab1, tab2, tab3, tab4 = st.tabs(["📊 Score Breakdown", "🎯 Decision Logic", "📈 Performance", "🔧 Technical"])
-                    
-                    with tab1:
-                        st.markdown("<h3 style='font-size: 12px; font-weight: 700; color: #1e3a8a;'>📊 Score Analysis</h3>", unsafe_allow_html=True)
-                        
-                        features = result.get('features', {})
-                        rel = result.get('ml_reliability', 0.0)
-                        dec = result.get('deception_confidence', 0.0)
-                        
-                        # Calculate Stage 1 cost using new formula: c(s,t) = 10 * (1 - reliability[s])
-                        stage1_cost = 10.0 * (1.0 - rel) if rel is not None else 0.0
-                        
-                        # Interactive gauges side by side
-                        gauge_col1, gauge_col2 = st.columns(2)
-                    
-                        with gauge_col1:
-                            # Reliability gauge with cleaner design
-                            fig_rel = go.Figure(go.Indicator(
-                                mode="gauge+number",
-                                value=rel * 100,
-                                number={'suffix': '%', 'font': {'size': 16}},
-                                title={'text': "<b>Reliability Score</b><br><span style='font-size:8px; color:#6b7280'>ML Assessment</span>", 'font': {'size': 12}},
+            st.markdown("""
+            <p style='font-size: 11px; color: #0f766e; margin: 0 0 0.6rem 0; font-style: italic;'>
+                Upload CSV file, select number of sources to use, then validate before optimisation.
+            </p>
+            """, unsafe_allow_html=True)
 
-                                gauge={
-                                    'axis': {'range': [0, 100], 'tickwidth': 1, 'ticksuffix': '%'},
-                                    'bar': {'color': "#10b981", 'thickness': 0.8},
-                                    'bgcolor': "white",
-                                    'steps': [
-                                        {'range': [0, 35], 'color': "#fee2e2"},
-                                        {'range': [35, 50], 'color': "#fef3c7"},
-                                        {'range': [50, 100], 'color': "#dcfce7"}
-                                    ],
-                                    'threshold': {
-                                        'line': {'color': "#dc2626", 'width': 3},
-                                        'thickness': 0.8,
-                                        'value': result.get('recourse_rules', {}).get('rel_ci_flag', 0.50) * 100
-                                    }
-                                }
-                            ))
-                            fig_rel.update_layout(
-                                height=250,
-                                margin=dict(l=20, r=20, t=60, b=20),
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                font={'family': "system-ui, -apple-system, sans-serif"}
-                            )
-                            st.plotly_chart(fig_rel, use_container_width=True)
-                            
-                            # Classification badge
-                            rel_class = result.get('confidence_metrics', {}).get('reliability_confidence', 'medium')
-                            class_color = {'high': '#10b981', 'medium': '#f59e0b', 'low': '#ef4444'}.get(rel_class, '#6b7280')
-                            st.markdown(f"""
-                            <div style='text-align: center; padding: 0.5rem; background: {class_color}20; 
-                                        border-radius: 6px; border: 1px solid {class_color};'>
-                                <span style='color: {class_color}; font-weight: 600; font-size: 8px;'>
-                                    {rel_class.upper()} CONFIDENCE
-                                </span>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        
-                        with gauge_col2:
-                            # Deception risk gauge with cleaner design
-                            fig_dec = go.Figure(go.Indicator(
-                                mode="gauge+number",
-                                value=dec * 100,
-                                number={'suffix': '%', 'font': {'size': 32}},
-                                title={'text': "<b>Deception Risk</b><br><span style='font-size:12px; color:#6b7280'>ML Assessment</span>", 'font': {'size': 16}},
+            uploaded_file = st.file_uploader("Upload sources CSV", type=["csv"], key="csv_upload", label_visibility="collapsed")
 
-                                gauge={
-                                    'axis': {'range': [0, 100], 'tickwidth': 1, 'ticksuffix': '%'},
-                                    'bar': {'color': "#ef4444", 'thickness': 0.8},
-                                    'bgcolor': "white",
-                                    'steps': [
-                                        {'range': [0, 30], 'color': "#dcfce7"},
-                                        {'range': [30, 60], 'color': "#fef3c7"},
-                                        {'range': [60, 100], 'color': "#fee2e2"}
-                                    ],
-                                    'threshold': {
-                                        'line': {'color': "#dc2626", 'width': 3},
-                                        'thickness': 0.8,
-                                        'value': result.get('recourse_rules', {}).get('dec_ci_flag', 0.60) * 100
-                                    }
-                                }
-                            ))
-                            fig_dec.update_layout(
-                                height=250,
-                                margin=dict(l=20, r=20, t=60, b=20),
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                font={'family': "system-ui, -apple-system, sans-serif"}
-                            )
-                            st.plotly_chart(fig_dec, use_container_width=True)
-                            
-                            # Risk level badge
-                            dec_class = result.get('confidence_metrics', {}).get('deception_confidence', 'medium_risk')
-                            risk_display = dec_class.replace('_', ' ').upper()
-                            risk_color = {'low': '#10b981', 'low_risk': '#10b981', 'medium': '#f59e0b', 'medium_risk': '#f59e0b', 'high': '#ef4444', 'high_risk': '#ef4444'}.get(dec_class, '#6b7280')
-                            st.markdown(f"""
-                            <div style='text-align: center; padding: 0.5rem; background: {risk_color}20; 
-                                        border-radius: 6px; border: 1px solid {risk_color};'>
-                                <span style='color: {risk_color}; font-weight: 600; font-size: 8px;'>
-                                    {risk_display}
-                                </span>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        
-                        # Feature contribution visualization
-                        st.markdown("---")
-                        st.markdown("**Feature Impact Analysis**")
-                        
-                        tsr = features.get('task_success_rate', 0)
-                        cor = features.get('corroboration_score', 0)
-                        tim = features.get('report_timeliness', 0)
-                        
-                        fig_features = go.Figure()
-                        
-                        feature_data = [
-                            ('Task Success Rate', tsr, 0.30),
-                            ('Corroboration', cor, 0.35),
-                            ('Timeliness', tim, 0.25)
-                        ]
-                        
-                        for fname, fval, weight in feature_data:
-                            contribution = fval * weight
-                            color = '#10b981' if fval >= 0.7 else '#f59e0b' if fval >= 0.5 else '#ef4444'
-                            
-                            fig_features.add_trace(go.Bar(
-                                y=[fname],
-                                x=[contribution],
-                                orientation='h',
-                                name=fname,
-                                marker=dict(color=color),
-                                text=f"{fval:.1%} × {weight:.0%} = {contribution:.3f}",
-                                textposition='outside',
-                                hovertemplate=f"<b>{fname}</b><br>Value: {fval:.1%}<br>Weight: {weight:.0%}<br>Contribution: {contribution:.3f}<extra></extra>"
-                            ))
-                        
-                        fig_features.update_layout(
-                            title="Weighted Contributions to Reliability Score",
-                            xaxis_title="Contribution to Final Score",
-                            height=220,
-                            margin=dict(l=20, r=20, t=40, b=40),
-                            showlegend=False,
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            xaxis=dict(gridcolor='#e5e7eb'),
-                            font={'family': "system-ui, -apple-system, sans-serif", 'size': 8}
-                        )
-                        st.plotly_chart(fig_features, use_container_width=True)
-                    
-                    with tab2:
-                        st.markdown("<h3 style='font-size: 12px; font-weight: 700; color: #1e3a8a;'>🎯 Decision Logic</h3>", unsafe_allow_html=True)
-                        
-                        decision = result.get('decision', 'unknown')
-                        action_reason = result.get('action_reason', 'No reason provided')
-                        tasks = result.get('tssp_allocation', [])
-                        
-                        # Decision card
-                        decision_config = {
-                            'task': {
-                                'title': '✅ CLEARED FOR TASKING',
-                                'color': '#10b981',
-                                'bg': '#ecfdf5',
-                                'action': 'Source fully operational under standard protocols',
-                                'icon': '✅'
-                            },
-                            'flag_and_task': {
-                                'title': '⚠️ TASKABLE WITH OVERSIGHT',
-                                'color': '#f59e0b',
-                                'bg': '#fffbeb',
-                                'action': 'Source operational but requires enhanced monitoring',
-                                'icon': '⚠️'
-                            },
-                            'flag_for_ci': {
-                                'title': '🚩 FLAGGED FOR CI REVIEW',
-                                'color': '#f59e0b',
-                                'bg': '#fffbeb',
-                                'action': 'Enhanced counterintelligence review required',
-                                'icon': '🚩'
-                            },
-                            'disengage': {
-                                'title': '⛔ DISENGAGED',
-                                'color': '#ef4444',
-                                'bg': '#fef2f2',
-                                'action': 'Source removed from operational consideration',
-                                'icon': '⛔'
-                            }
-                        }
-                        
-                        config = decision_config.get(decision, {
-                            'title': '❓ UNKNOWN STATUS',
-                            'color': '#6b7280',
-                            'bg': '#f3f4f6',
-                            'action': 'Decision could not be determined',
-                            'icon': '❓'
-                        })
-                        
-                        st.markdown(f"""
-                        <div style='background: {config['bg']}; border-radius: 12px; padding: 1.5rem; 
-                                    border-left: 5px solid {config['color']}; margin-bottom: 1rem;'>
-                            <h3 style='color: {config['color']}; margin: 0 0 0.5rem 0; font-size: 12px;'>
-                                {config['icon']} {config['title']}
-                            </h3>
-                            <p style='margin: 0; color: #374151; font-size: 8px; line-height: 1.6;'>
-                                <b>Rationale:</b> {action_reason}
-                            </p>
-                            <p style='margin: 0.5rem 0 0 0; color: #374151; font-size: 8px;'>
-                                <b>Action:</b> {config['action']}
-                            </p>
-                        </div>
-                        """, unsafe_allow_html=True)
-                        
-                        # Task allocation
-                        if tasks:
-                            st.markdown(f"**📋 Assigned Tasks ({len(tasks)})**")
-                            task_display = ', '.join(tasks[:8])
-                            if len(tasks) > 8:
-                                task_display += f" +{len(tasks)-8} more"
-                            st.info(task_display)
-                        else:
-                            st.markdown("**📋 Task Assignment:** None")
-                        
-                        # Threshold comparison visual
-                        st.markdown("---")
-                        st.markdown("**Threshold Analysis**")
-                        
-                        rules = result.get('recourse_rules', {})
-                        
-                        # Create threshold comparison chart
-                        fig_thresh = go.Figure()
-                        
-                        # Add reliability bar
-                        fig_thresh.add_trace(go.Bar(
-                            y=['Reliability'],
-                            x=[rel],
-                            name='Current Value',
-                            orientation='h',
-                            marker=dict(color='#10b981'),
-                            text=f"{rel:.2%}",
-                            textposition='inside'
-                        ))
-                        
-                        # Add deception bar
-                        fig_thresh.add_trace(go.Bar(
-                            y=['Deception Risk'],
-                            x=[dec],
-                            name='Current Value',
-                            orientation='h',
-                            marker=dict(color='#ef4444'),
-                            text=f"{dec:.2%}",
-                            textposition='inside',
-                            showlegend=False
-                        ))
-                        
-                        # Add threshold lines
-                        fig_thresh.add_vline(x=rules.get('rel_ci_flag', 0.50), line_dash="dash", 
-                                            line_color="#dc2626", annotation_text="Rel Flag Threshold")
-                        fig_thresh.add_vline(x=rules.get('dec_ci_flag', 0.60), line_dash="dash", 
-                                            line_color="#dc2626", annotation_text="Dec Flag Threshold")
-                        
-                        fig_thresh.update_layout(
-                            title="Score vs. Decision Thresholds",
-                            xaxis_title="Score",
-                            xaxis=dict(range=[0, 1], tickformat=".0%"),
-                            height=200,
-                            margin=dict(l=20, r=20, t=40, b=40),
-                            showlegend=False,
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
-                            font={'family': "system-ui, -apple-system, sans-serif", 'size': 8}
-                        )
-                        st.plotly_chart(fig_thresh, use_container_width=True)
-                    
-                    with tab3:
-                        st.markdown("<h3 style='font-size: 12px; font-weight: 700; color: #1e3a8a;'>📈 Performance Metrics</h3>", unsafe_allow_html=True)
-                        
-                        # Key performance indicators
-                        perf_col1, perf_col2, perf_col3 = st.columns(3)
-                        
-                        risk = result.get('expected_risk', 0.5)
-                        opt_score = result.get('optimization_score', 0)
-                        
-                        with perf_col1:
-                            st.metric(
-                                "Expected Risk",
-                                f"{risk:.1%}",
-                                delta=f"{(0.5-risk)*100:+.1f}%",
-                                delta_color="inverse",
-                                help="Predicted operational risk level"
-                            )
-                        
-                        with perf_col2:
-                            st.metric(
-                                "Optimization Score",
-                                f"{opt_score:.3f}",
-                                help="TSSP optimization objective value"
-                            )
-                        
-                        with perf_col3:
-                            is_taskable = result.get('is_taskable', False)
-                            st.metric(
-                                "Operational Status",
-                                "✅ Taskable" if is_taskable else "⛔ Not Taskable",
-                                help="Whether source is cleared for task assignment"
-                            )
-                        
-                        # Cost information using new formula
-                        st.markdown("---")
-                        st.markdown("**Cost Structure**")
-                        cost_info_col1, cost_info_col2 = st.columns(2)
-                        with cost_info_col1:
-                            st.markdown(f"""
-                            <div style='background: #f0f9ff; padding: 0.8rem; border-radius: 8px; border-left: 3px solid #3b82f6;'>
-                                <p style='margin: 0 0 0.3rem 0; font-size: 10px; font-weight: 600; color: #1e40af;'>
-                                    Stage 1 Cost (Strategic Tasking)
-                                </p>
-                                <p style='margin: 0; font-size: 14px; font-weight: 700; color: #1e3a8a;'>
-                                    {stage1_cost:.2f}
-                                </p>
-                                <p style='margin: 0.3rem 0 0 0; font-size: 9px; color: #64748b;'>
-                                    Formula: c(s,t) = 10 × (1 - reliability)
-                                </p>
-                            </div>
-                            """, unsafe_allow_html=True)
-                        with cost_info_col2:
-                            # Show behavior probabilities if available
-                            behavior_probs = result.get('behavior_probabilities', {})
-                            if behavior_probs:
-                                st.markdown("**Behavior Probabilities:**")
-                                for behavior, prob in behavior_probs.items():
-                                    st.caption(f"{behavior}: {prob:.1%}")
-                        
-                        # EMV comparison
-                        if result.get('emv'):
-                            st.markdown("---")
-                            st.markdown("**Expected Monetary Value (EMV) Comparison**")
-                            st.caption("Comparing ML-TSSP optimization against baseline methods (normalized to worst-case)")
-                            
-                            emv = result.get('emv', {})
-                            ml_val = emv.get('ml_tssp', 0)
-                            det_val = emv.get('deterministic', 0)
-                            uni_val = emv.get('uniform', 0)
+            if uploaded_file:
+                df = pd.read_csv(uploaded_file)
 
-                            # For a single-source display, worst-case is Lmax=1.0, so percent = value * 100
-                            ml_pct = emv_to_percent(ml_val, n_sources=1, lmax=1.0)
-                            det_pct = emv_to_percent(det_val, n_sources=1, lmax=1.0)
-                            uni_pct = emv_to_percent(uni_val, n_sources=1, lmax=1.0)
-                            
-                            fig_emv = go.Figure()
-                            
-                            methods = ['ML-TSSP', 'Deterministic', 'Uniform']
-                            values = [ml_pct, det_pct, uni_pct]
-                            colors = ['#10b981', '#f59e0b', '#6b7280']
-                            
-                            fig_emv.add_trace(go.Bar(
-                                x=methods,
-                                y=values,
-                                marker=dict(color=colors),
-                                text=[f"{v:.1f}%" for v in values],
-                                textposition='outside'
-                            ))
-                            
-                            fig_emv.update_layout(
-                                title="EMV Method Comparison",
-                                yaxis_title="EMV (% of worst-case)",
-                                height=280,
-                                margin=dict(l=20, r=20, t=40, b=40),
-                                showlegend=False,
-                                paper_bgcolor="rgba(0,0,0,0)",
-                                plot_bgcolor="rgba(0,0,0,0)",
-                                yaxis=dict(gridcolor='#e5e7eb', ticksuffix="%"),
-                                font={'family': "system-ui, -apple-system, sans-serif", 'size': 8}
-                            )
-                            st.plotly_chart(fig_emv, use_container_width=True)
-                            
-                            # Performance delta
-                            ml_vs_det = ((ml_val - det_val) / det_val * 100) if det_val != 0 else 0
-                            ml_vs_uni = ((ml_val - uni_val) / uni_val * 100) if uni_val != 0 else 0
-                            
-                            delta_col1, delta_col2 = st.columns(2)
-                            with delta_col1:
-                                st.metric("vs. Deterministic", f"{ml_vs_det:+.1f}%")
-                            with delta_col2:
-                                st.metric("vs. Uniform", f"{ml_vs_uni:+.1f}%")
-                    
-                    with tab4:
-                        st.markdown("<h3 style='font-size: 12px; font-weight: 700; color: #1e3a8a;'>🔧 Technical Details</h3>", unsafe_allow_html=True)
-                        
-                        # Source inputs summary
-                        st.markdown("**Input Features**")
-                        features = result.get('features', {})
-                        
-                        feat_df_data = []
-                        for k, v in features.items():
-                            feat_df_data.append({
-                                'Feature': k.replace('_', ' ').title(),
-                                'Value': f"{v:.3f}" if isinstance(v, (int, float)) else str(v)
-                            })
-                        
-                        if feat_df_data:
-                            feat_df = pd.DataFrame(feat_df_data)
-                            st.dataframe(feat_df, use_container_width=True, hide_index=True)
-                        
-                        # Processing info
-                        st.markdown("---")
-                        st.markdown("**Processing Information**")
-                        
-                        api_method = result.get('api_method', 'unknown')
-                        method_display = {
-                            'local_ml_pipeline': 'Local ML Pipeline',
-                            'fallback': 'Local Fallback',
-                            'api': 'Backend API'
-                        }.get(api_method, 'Unknown')
-                        
-                        st.info(f"Processing Method: **{method_display}**")
-                        st.markdown(f"Source ID: `{result.get('source_id', 'Unknown')}`")
-                        
-                        # Confidence metrics
-                        conf_metrics = result.get('confidence_metrics', {})
-                        if conf_metrics:
-                            st.markdown("---")
-                            st.markdown("**Confidence Assessment**")
-                            
-                            rel_conf = conf_metrics.get('reliability_confidence', 'unknown').replace('_', ' ').title()
-                            dec_conf = conf_metrics.get('deception_confidence', 'unknown').replace('_', ' ').title()
-                            overall = conf_metrics.get('overall_confidence', 'unknown').replace('_', ' ').title()
-                            
-                            st.markdown(f"Reliability: **{rel_conf}**")
-                            st.markdown(f"Deception Assessment: **{dec_conf}**")
-                            st.markdown(f"Overall Status: **{overall}**")
-                        
-                        # Recourse rules
-                        rules = result.get('recourse_rules', {})
-                        if rules:
-                            st.markdown("---")
-                            st.markdown("**Decision Thresholds**")
-                            
-                            thresh_col1, thresh_col2 = st.columns(2)
-                            with thresh_col1:
-                                st.markdown("*Reliability Thresholds:*")
-                                st.markdown(f"Disengage: `{rules.get('rel_disengage', 0):.2f}`")
-                                st.markdown(f"CI Flag: `{rules.get('rel_ci_flag', 0):.2f}`")
-                            with thresh_col2:
-                                st.markdown("*Deception Thresholds:*")
-                                st.markdown(f"CI Flag: `{rules.get('dec_ci_flag', 0):.2f}`")
-                                st.markdown(f"Disengage: `{rules.get('dec_disengage', 0):.2f}`")
-                    
-                        # Raw JSON export
-                        st.markdown("---")
-                        st.markdown("**Export Full Result**")
-                        
-                        try:
-                            def serialize_value(val):
-                                """Convert value to JSON-serializable format."""
-                                if isinstance(val, (np.integer, np.floating)):
-                                    return float(val)
-                                elif isinstance(val, np.ndarray):
-                                    return val.tolist()
-                                elif isinstance(val, dict):
-                                    return {k: serialize_value(v) for k, v in val.items()}
-                                elif isinstance(val, (list, tuple)):
-                                    return [serialize_value(v) for v in val]
-                                elif val is None:
-                                    return None
-                                elif isinstance(val, (str, int, float, bool)):
-                                    return val
-                                else:
-                                    return str(val)
-                            
-                            clean_result = {}
-                            for k, v in result.items():
-                                if k not in ['full_policy']:  # Skip large nested objects
-                                    try:
-                                        clean_result[k] = serialize_value(v)
-                                    except Exception:
-                                        clean_result[k] = str(v)
-                            
-                            # Export options
-                            json_col1, json_col2 = st.columns(2)
-                            
-                            with json_col1:
-                                # View JSON
-                                if st.button("👁️ View JSON", use_container_width=True):
-                                    st.json(clean_result)
-                            
-                            with json_col2:
-                                # Download JSON
-                                json_str = json.dumps(clean_result, indent=2)
-                                st.download_button(
-                                    label="💾 Download JSON",
-                                    data=json_str,
-                                    file_name=f"{result.get('source_id', 'source')}_result.json",
-                                    mime="application/json",
-                                    use_container_width=True
-                                )
-                            
-                        except Exception as e:
-                            st.error(f"**JSON Rendering Error:** {str(e)}")
-                            
-                            # Show error details
-                            with st.expander("🔍 Error Details"):
-                                import traceback
-                                st.code(traceback.format_exc())
-                            
-                            st.markdown("**Fallback - Raw String Representation:**")
-                            st.code(str(result), language="python")
-                            
-                            # Try to show at least the keys
-                            try:
-                                st.markdown("**Available Keys:**")
-                                for key in result.keys():
-                                    value_type = type(result[key]).__name__
-                                    value_preview = str(result[key])[:50] + "..." if len(str(result[key])) > 50 else str(result[key])
-                                    st.markdown(f"- `{key}` ({value_type}): {value_preview}")
-                            except:
-                                pass
-            
-            # ========== CSV UPLOAD & FILTER MODE ==========
-            elif input_mode == "📂 CSV Upload & Filter":
-                st.markdown("""
-                <p style='font-size: 11px; color: #0f766e; margin: 0 0 0.6rem 0; font-style: italic;'>
-                    Upload CSV, filter by column/value, then process for the optimisation engine.
-                </p>
-                """, unsafe_allow_html=True)
-                csv_upload = st.file_uploader("Upload CSV", type=["csv"], key="csv_filter_upload", label_visibility="collapsed")
-                user_df = None
-                filtered_df = None
-                filter_column = None
-                filter_value = None
-                run_mode = "Batch (All)"
-                selected_source_id = None
-                source_id_col = None
-                if csv_upload is not None:
-                    try:
-                        user_df = pd.read_csv(csv_upload)
-                        st.session_state["user_df"] = user_df
-                        filter_column = st.selectbox("Select column to filter", user_df.columns, key="csv_filter_col")
-                        if filter_column is not None:
-                            unique_vals = user_df[filter_column].dropna().unique()
-                            filter_value = st.selectbox("Select value", unique_vals, key="csv_filter_val")
-                            filtered_df = user_df[user_df[filter_column] == filter_value]
-                        else:
-                            filtered_df = user_df
-                        st.session_state["filter_column"] = filter_column
-                        st.session_state["filter_value"] = filter_value
-                        st.session_state["filtered_df"] = filtered_df
-                        run_mode = st.radio("Run mode", ["Batch (All)", "Single Source"], horizontal=True, key="csv_run_mode")
-                        st.session_state["run_mode"] = run_mode
-                        for c in user_df.columns:
-                            if str(c).lower() in ["source_id", "id", "src_id"]:
-                                source_id_col = c
-                                break
-                        if run_mode == "Single Source":
-                            if source_id_col and filtered_df is not None:
-                                ids = filtered_df[source_id_col].dropna().unique().tolist()
-                                selected_source_id = st.selectbox("Select Source ID", ids, key="csv_source_id")
-                            else:
-                                selected_source_id = st.text_input("Enter Source ID", key="csv_source_id_txt")
-                            st.session_state["selected_source_id"] = selected_source_id
-                            st.session_state["source_id_col"] = source_id_col
-                            if selected_source_id is not None and source_id_col and filtered_df is not None:
-                                sub = filtered_df[filtered_df[source_id_col].astype(str) == str(selected_source_id)]
-                                if not sub.empty:
-                                    filtered_df = sub
-                        with st.expander("👁️ Preview", expanded=False):
-                            st.dataframe((filtered_df if filtered_df is not None else user_df).head(20), use_container_width=True)
-                        df_to_process = _map_csv_to_batch_schema(filtered_df) if filtered_df is not None else None
-                        if df_to_process is not None and len(df_to_process) > 0:
-                            if run_mode == "Single Source" and (selected_source_id is None or (filtered_df is not None and len(filtered_df) > 1)):
-                                st.caption("Select a single source above to process.")
-                                df_to_process = None
-                        if df_to_process is not None and len(df_to_process) > 0:
-                            st.info(f"📋 {len(df_to_process)} source(s) ready. Process below to feed the optimisation engine.")
-                            recourse_rules = {
-                                "rel_disengage": st.session_state.get("rel_disengage_slider", 0.35),
-                                "rel_ci_flag": st.session_state.get("rel_ci_flag_slider", 0.50),
-                                "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
-                                "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60),
-                            }
-                            if st.button("▶ Validate & Load for Optimisation", type="primary", key="csv_process_btn", use_container_width=True):
-                                with st.spinner("Validating and loading…"):
-                                    results, errors = _process_batch_sources(df_to_process, recourse_rules)
-                                st.session_state.batch_results = results
-                                st.session_state.batch_errors = errors if errors else []
-                                st.session_state.batch_upload_pending = None
-                                st.session_state.batch_upload_pending_count = 0
-                                if errors:
-                                    st.warning(f"Loaded {len(results)} source(s) with {len(errors)} validation error(s). Check expander below.")
-                                else:
-                                    st.success("Data loaded. Use **Real Data Mode** in SIMULATION SCOPE and **Execute Optimization** in Source Profiles.")
-                                    # Clear results - optimization must be run explicitly
-                                    st.session_state["results"] = None
-                                    st.session_state["_has_executed_optimization"] = False
-                                    _safe_rerun("data loaded")
-                    except Exception as e:
-                        st.error(f"File error: {e}")
-                else:
-                        st.session_state["user_df"] = None
-                        st.session_state["filtered_df"] = None
-                        st.session_state["filter_column"] = None
-                        st.session_state["filter_value"] = None
-                        st.caption("Upload a CSV to filter and process. Data is used by the optimisation engine (Execute Optimization).")
+                if "source_id" not in df.columns:
+                    st.error("CSV must contain a 'source_id' column")
+                    st.stop()
 
-            # ========== ANALYST CONTROL: BATCH UPLOAD & VALIDATION ==========
-            if has_permission("upload_evaluation_data"):
-                with st.expander("🛠️ Analyst Control: Batch Upload & Validation", expanded=True):
-                    st.markdown("""
-<p style='font-size: 13px; color: #92400e; margin: 0 0 0.8rem 0; font-style: italic; font-weight:600;'>
-    Upload Excel/CSV file for multiple sources at once.<br>
-    <span style='color:#b91c1c;'>You must <b>Validate & Load Batch</b> after upload to use your data!</span>
-</p>
-""", unsafe_allow_html=True)
+                st.success(f"📊 {len(df)} sources loaded from CSV")
 
-                    if st.session_state.get("_clear_batch_upload_file"):
-                        st.session_state.pop("batch_upload_file", None)
-                    st.session_state["_clear_batch_upload_file"] = False
+                # Preview data
+                with st.expander("👁️ Preview Uploaded Data", expanded=False):
+                    st.dataframe(df.head(20), use_container_width=True)
+                    st.caption(f"Showing first 20 of {len(df)} sources. Full dataset has {len(df.columns)} columns.")
 
-                    uploaded_file = st.file_uploader(
-                        "Upload source data file",
-                        type=["csv", "xlsx", "xls"],
-                        help="File must contain columns: source_id, task_success_rate, corroboration_score, report_timeliness",
-                        label_visibility="collapsed",
-                        key="batch_upload_file",
-                        disabled=False
-                    )
-
-                    col_template, col_limit = st.columns(2)
-                    with col_template:
-                        template_csv = "source_id,task_success_rate,corroboration_score,report_timeliness,handler_confidence,deception_score,ci_flag\nSRC_001,0.85,0.75,0.90,0.80,0.20,0\nSRC_002,0.65,0.60,0.70,0.65,0.35,0\nSRC_003,0.90,0.85,0.95,0.88,0.15,1"
-                        st.download_button(
-                            label="📥 Download Template",
-                            data=template_csv,
-                            file_name="source_template.csv",
-                            mime="text/csv",
-                            use_container_width=True
-                        )
-                    with col_limit:
-                        max_rows = st.number_input(
-                            "Max rows",
-                            min_value=1,
-                            max_value=500,
-                            value=st.session_state.get("batch_max_rows", 100),
-                            key="batch_max_rows",
-                            help="Limit number of sources to process"
-                        )
-
-                    recourse_rules = {
-                        "rel_disengage": st.session_state.get("rel_disengage_slider", 0.35),
-                        "rel_ci_flag": st.session_state.get("rel_ci_flag_slider", 0.50),
-                        "dec_disengage": st.session_state.get("dec_disengage_slider", 0.75),
-                        "dec_ci_flag": st.session_state.get("dec_ci_flag_slider", 0.60),
-                    }
-                    df_to_process = None
-                    # Only process the uploaded file if present
-                    if uploaded_file is not None:
-                        try:
-                            if uploaded_file.name.endswith('.csv'):
-                                df = pd.read_csv(uploaded_file)
-                            else:
-                                df = pd.read_excel(uploaded_file)
-                            df_limited = df.head(int(max_rows))
-                            if len(df) > max_rows:
-                                st.warning(f"⚠️ File has {len(df)} rows. Using first {int(max_rows)}.")
-                            st.session_state.batch_upload_pending = df_limited
-                            st.session_state.batch_upload_pending_count = len(df_limited)
-                            df_to_process = df_limited
-                            st.info(f"📋 Loaded {len(df_limited)} sources from file")
-                            with st.expander("👁️ Preview Data"):
-                                st.dataframe(df_limited.head(10), use_container_width=True)
-                        except Exception as e:
-                            st.error(f"**File Error:** {str(e)}")
-
-                    # If batch is pending validation, show prominent Validate & Load Batch button
-                    if st.session_state.get("batch_upload_pending") is not None:
-                        pending = st.session_state.batch_upload_pending
-                        st.session_state.batch_upload_pending_count = len(pending)
-                        df_to_process = pending
-                        st.info(f"📋 Loaded {len(pending)} sources (ready to process)")
-                        with st.expander("👁️ Preview Data"):
-                            st.dataframe(pending.head(10), use_container_width=True)
-                        # Prominent Validate & Load Batch button
-                        st.markdown("""
-<div style='margin:1.2rem 0 0.5rem 0; text-align:center;'>
-    <span style='font-size:15px; color:#0f172a; font-weight:600;'>Step 2: Validate & Load Batch</span>
-</div>
-""", unsafe_allow_html=True)
-                        if st.button("▶ Validate & Load Batch", type="primary", use_container_width=True):
-                            with st.spinner(f"🔄 Validating {len(df_to_process)} sources..."):
-                                results, errors = _process_batch_sources(df_to_process, recourse_rules)
-                            st.session_state.batch_results = results
-                            st.session_state.batch_errors = errors
-                            st.session_state.batch_upload_pending = None
-                            st.session_state.batch_upload_pending_count = 0
-                            # Ensure optimization results are cleared until Execute Optimization runs
-                            # But only if we are actually changing the data pool
-                            st.session_state["results"] = None
-                            st.session_state["_has_executed_optimization"] = False
-                            st.session_state["results_version"] = 0
-                            st.session_state["results_changed"] = False
-                            st.session_state["last_update_time"] = "Never"
-                            st.session_state["_pending_recompute"] = False
-                            # Auto-switch to Real Data Mode after successful validation
-                            st.session_state["data_source_mode"] = "📊 Real Data Mode (Your Input)"
-                            st.success("Batch validated and loaded! Switched to Real Data Mode.")
-                            _safe_rerun("batch loaded")
-
-                # Display batch results incrementally
-                if ("batch_results" in st.session_state and st.session_state.batch_results) or st.session_state.get("batch_errors"):
-                    results = st.session_state.get("batch_results", [])
-                    errors = st.session_state.get("batch_errors", [])
-                    st.markdown("""
-                    <div style='background: #ecfdf5; border-radius: 8px; padding: 0.8rem; margin-top: 1rem; border: 2px solid #10b981;'>
-                        <p style='margin: 0; font-size: 12px; font-weight: 700; color: #047857;'>
-                            📊 BATCH VALIDATION RESULTS
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Validated", len(results))
-                    with col2:
-                        st.metric("Errors", len(errors))
-                    with col3:
-                        st.metric("Ready for Optimization", len(results))
-                    if errors:
-                        with st.expander("⚠️ Validation Errors", expanded=False):
-                            for err in errors:
-                                st.error(err)
-                    if results:
-                        st.success(f"{len(results)} sources validated and ready. Proceed to Execute Optimization.")
-                else:
-                    st.caption("Upload a CSV/XLSX file to begin batch validation.")
-                    # Do not clear results or trigger reruns here; this block runs every render
-                
-                # Ensure data_mode and counts are always defined before use
-                data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
-                custom_count = len(st.session_state.get("custom_sources_pool", []))
-                batch_count = len(st.session_state.get("batch_results", []))
-                pending_count = int(st.session_state.get("batch_upload_pending_count", 0) or 0)
-                total_input_count = custom_count + batch_count
-                if data_mode == "📊 Real Data Mode (Your Input)":
-                    st.markdown(f"""
-                    <div style='background: #ecfdf5; border: 1px solid #10b981; border-radius: 6px; 
-                                padding: 0.6rem; margin: 0.8rem 0;'>
-                        <p style='margin: 0; font-size: 11px; color: #047857; font-weight: 600;'>
-                            ✅ Real Data Mode (your upload/input)
-                        </p>
-                        <p style='margin: 0.3rem 0 0 0; font-size: 9px; color: #065f46;'>
-                            {custom_count} single + {batch_count} batch + {pending_count} pending → {total_input_count} total
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    num_sources = total_input_count
-                    if batch_count == 0 and pending_count > 0:
-                        st.info(f"📌 {pending_count} sources loaded. Click **Validate & Load Batch** in SOURCE DATA INPUT.")
-                    else:
-                        st.info(f"📌 Using {num_sources} source(s) from your input")
-                    # Show validation success message after batch validation
-                    if st.session_state.get("batch_results") and not st.session_state.get("batch_errors"):
-                        st.success("✅ Data validation successful. Your data is ready for optimization.")
-                elif data_mode == "🎮 Demo Mode (Generated Sources)":
-                    st.markdown("""
-                    <div style='background: #eff6ff; border: 1px solid #93c5fd; border-radius: 6px; 
-                                padding: 0.6rem; margin: 0.8rem 0;'>
-                        <p style='margin: 0; font-size: 11px; color: #1e40af; font-weight: 600;'>
-                            🎮 Demo Mode Active
-                        </p>
-                        <p style='margin: 0.3rem 0 0 0; font-size: 9px; color: #1e3a8a;'>
-                            Using generated sources for demonstration. Your input data ({total_input_count} source(s)) is saved and can be analyzed in Real Data Mode.
-                        </p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    num_sources = st.slider(
-                        "Number of sources",
-                        1, 80,
-                        default_sources if preset_mode != "⚙️ Custom" else min(st.session_state.get("sources_count", 20), 80),
-                        key="num_sources_slider",
-                        help="Total generated sources in demo pool",
-                        on_change=_mark_results_stale
-                    )
-                else:
-                    # Fallback: ensure num_sources is always defined
-                    num_sources = st.session_state.get("sources_count", 20)
-            else:
-                # No input data: demo only (do not set data_source_mode; widget owns that key)
-                st.markdown("""
-                <div style='background: #eff6ff; border: 1px solid #93c5fd; border-radius: 6px; 
-                            padding: 0.6rem; margin: 0.8rem 0;'>
-                    <p style='margin: 0; font-size: 11px; color: #1e40af; font-weight: 600;'>
-                        🎮 Demo Mode (No Input Data)
-                    </p>
-                    <p style='margin: 0.3rem 0 0 0; font-size: 9px; color: #1e3a8a;'>
-                        Using generated sources. Add data via SOURCE DATA INPUT to enable Real Data Mode.
-                    </p>
-                </div>
-                """, unsafe_allow_html=True)
-                data_mode = "🎮 Demo Mode (Generated Sources)"
-                num_sources = st.slider(
-                    "Number of sources",
-                    1, 80,
-                    default_sources if preset_mode != "⚙️ Custom" else min(st.session_state.get("sources_count", 20), 80),
-                    key="num_sources_slider",
-                    help="Total generated sources in demo pool",
-                    on_change=_mark_results_stale
+                # Source selection
+                max_sources = min(500, len(df))  # Cap at 500 sources
+                num_sources_to_use = st.slider(
+                    f"Select number of sources to use (max {max_sources})",
+                    min_value=1,
+                    max_value=max_sources,
+                    value=min(50, max_sources),  # Default to 50 or max available
+                    step=1,
+                    key="num_sources_to_use",
+                    help=f"Choose how many sources to include in optimization (up to {max_sources})"
                 )
-            st.markdown("<p style='font-size: 10px; color: #6b7280; margin: -0.5rem 0 0.8rem 0; font-style: italic;'>Total sources in the optimization pool</p>", unsafe_allow_html=True)
-            
-            # Ensure num_sources is always defined before use
-            if 'num_sources' not in locals():
-                num_sources = st.session_state.get("sources_count", 20)
-            st.session_state.sources_count = num_sources
-            source_ids = [f"SRC_{k + 1:03d}" for k in range(num_sources)]
-            jump_source_id = st.selectbox(
-                "Jump to source",
-                source_ids,
-                index=None,
-                key="jump_source",
-                placeholder="Type or select a source",
-                help="Quick navigation to specific source profile"
-            )
+
+                # Validation and processing
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("✅ Validate & Process Sources", key="validate_sources", use_container_width=True, type="primary"):
+                        # Take first N sources from the dataframe
+                        processed_df = df.head(num_sources_to_use).copy()
+
+                        # Store in session state
+                        st.session_state["sources_df"] = processed_df
+                        st.session_state["sources_validated"] = True
+
+                        st.success(f"✅ Successfully validated and processed {len(processed_df)} sources for optimization!")
+                        st.rerun()
+
+                with col2:
+                    if st.button("🔄 Clear Data", key="clear_sources", use_container_width=True):
+                        if "sources_df" in st.session_state:
+                            del st.session_state["sources_df"]
+                        if "sources_validated" in st.session_state:
+                            del st.session_state["sources_validated"]
+                        st.success("🧹 Data cleared. Upload a new CSV to continue.")
+                        st.rerun()
+
+                # Show validation status
+                if st.session_state.get("sources_validated"):
+                    validated_count = len(st.session_state.get("sources_df", []))
+                    st.info(f"📋 {validated_count} sources ready for optimization")
+                else:
+                    st.warning("⚠️ Sources not yet validated. Click 'Validate & Process Sources' to proceed.")
+
+            else:
+                # Demo mode: allow user to set number of sources
+                num_sources = st.slider(
+                    "Number of demo sources",
+                    1, 80,
+                    st.session_state.get("sources_count", 20),
+                    key="num_sources_slider",
+                    help="Total generated sources in demo pool"
+                )
+                st.session_state.sources_count = num_sources
+                st.caption("Upload a CSV file to use real data, or adjust the slider for demo sources.")
         
         # ========== DECISION THRESHOLDS CARD ==========
         can_edit_thresholds = has_permission("configure_parameters")
@@ -8415,11 +7299,13 @@ def render_streamlit_app():
                     st.session_state["_last_auto_recompute_time"] = time.time()
                     # Trigger optimization automatically
                     st.session_state["_optimization_in_progress"] = True
-                    payload = {"sources": sources, "seed": 42}
-                    n_sources = len(sources) if sources else 0
+                    sources = st.session_state.get("sources", [])
+                    sources_for_recompute = sources
+                    payload = {"sources": sources_for_recompute, "seed": 42}
+                    n_sources = len(sources_for_recompute) if sources_for_recompute else 0
                     if n_sources > 0:
                         # Use the execution helper
-                        _run_optimization_execution(sources, n_sources, payload, username, role)
+                        _run_optimization_execution(sources_for_recompute, n_sources, payload, username, role)
                         st.rerun()
         
         # #region agent log
@@ -8474,6 +7360,9 @@ def render_streamlit_app():
         mission_confidence = min(0.95, 0.65 + strictness_score * 0.35)
         
         confidence_color = "#10b981" if mission_confidence > 0.8 else "#f59e0b" if mission_confidence > 0.7 else "#ef4444"
+        
+        # Get number of sources from session state
+        num_sources = len(st.session_state.get("sources", []))
         
         # Calculate additional metrics
         expected_high_risk = int(num_sources * (1 - strictness_score) * 0.3)
@@ -8553,55 +7442,35 @@ def render_streamlit_app():
     # ======================================================
     # 1. DECISION OPTIMIZATION ENGINE
     # ======================================================
-    # PROFESSIONAL STABILITY FIX: Use sources from session state if they were synced
     # This ensures Executive/Oversight see the same data as the Analyst
-    sources = st.session_state.get("sources", [])
-    
-    data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
-    use_real_data = (data_mode == "📊 Real Data Mode (Your Input)")
-    
-    # Only rebuild sources list if we are the Analyst in Real Data Mode
-    # or if no sources exist yet
-    if not sources or (use_real_data and has_permission("execute_optimization")):
-        sources = []
-        custom_count = len(st.session_state.get("custom_sources_pool", []))
-        batch_count = len(st.session_state.get("batch_results", []))
-        
-        if use_real_data:
-            if custom_count + batch_count == 0:
-                use_real_data = False
-        
-        if use_real_data:
-            # REAL DATA MODE: use custom + processed batch only
-            current_rules = st.session_state.get("recourse_rules") or {
-                "rel_disengage": 0.35, "rel_ci_flag": 0.50,
-                "dec_disengage": 0.75, "dec_ci_flag": 0.60,
-            }
-            if st.session_state.get("custom_sources_pool"):
-                for custom_src in st.session_state.custom_sources_pool:
-                    sources.append({
-                        "source_id": custom_src.get("source_id"),
-                        "features": custom_src.get("features"),
-                        "reliability_series": [],
-                        "recourse_rules": current_rules,
-                    })
-            if st.session_state.get("batch_results"):
-                for batch_src in st.session_state.batch_results:
-                    sources.append({
-                        "source_id": batch_src.get("source_id"),
-                        "features": batch_src.get("features"),
-                        "reliability_series": batch_src.get("reliability_series", []),
-                        "recourse_rules": current_rules,
-                    })
-        else:
-            # DEMO MODE: generate synthetic sources
-            recourse_rules = st.session_state.get("recourse_rules") or get_active_recourse_rules()
-            n = int(st.session_state.get("sources_count", 20))
-            n = max(1, min(500, n))
-            sources = _generate_demo_sources(n, recourse_rules)
-        
-        # Update session state so other logic can use these sources
+    # Use validated sources_df from session state as the single source of truth for uploaded data
+    sources_df = st.session_state.get("sources_df")
+    sources_validated = st.session_state.get("sources_validated", False)
+    sources = []
+    if sources_df is not None and len(sources_df) > 0 and sources_validated:
+        # Build sources from validated DataFrame
+        current_rules = st.session_state.get("recourse_rules") or {
+            "rel_disengage": 0.35, "rel_ci_flag": 0.50,
+            "dec_disengage": 0.75, "dec_ci_flag": 0.60,
+        }
+        for _, row in sources_df.iterrows():
+            features = {col: row[col] for col in sources_df.columns if col != "source_id"}
+            sources.append({
+                "source_id": row["source_id"],
+                "features": features,
+                "reliability_series": [],
+                "recourse_rules": current_rules,
+            })
         st.session_state["sources"] = sources
+        st.session_state["data_source_mode"] = "📊 Real Data Mode (Your Input)"
+    else:
+        # DEMO MODE: generate synthetic sources
+        recourse_rules = st.session_state.get("recourse_rules") or get_active_recourse_rules()
+        n = int(st.session_state.get("sources_count", 20))
+        n = max(1, min(500, n))
+        sources = _generate_demo_sources(n, recourse_rules)
+        st.session_state["sources"] = sources
+        st.session_state["data_source_mode"] = "🎮 Demo Mode (Generated Sources)"
 
     # Validation error display (Analyst only)
     if has_permission("execute_optimization") and st.session_state.get("batch_errors"):
@@ -8617,6 +7486,10 @@ def render_streamlit_app():
     
     # Auto-refresh disabled: results only change after explicit Execute Optimization
     st.session_state["results_stale"] = False
+
+    # Define use_real_data based on data source mode
+    data_mode = st.session_state.get("data_source_mode", "🎮 Demo Mode (Generated Sources)")
+    use_real_data = (data_mode == "📊 Real Data Mode (Your Input)")
 
     # Show Decision Optimization Engine only on Source Profiles tab
     # DYNAMIC UPDATES: This section updates automatically when parameters change
@@ -8667,209 +7540,184 @@ def render_streamlit_app():
             # Check ML models availability
             models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
             button_enabled = can_execute_optimization and models_available
-            
-            if not can_execute_optimization:
-                st.info("Optimization execution is restricted for your role.")
-            elif not models_available:
-                st.error("❌ ML-TSSP models are not loaded. Optimization cannot run. Please ensure ML models are properly initialized.")
-            
-            # Safe navigation fallback for analysts (if radio widget state desyncs)
-            if can_execute_optimization and nav_key != "profiles":
-                if st.button("📋 Navigate to Source Profiles", key="nav_to_profiles_fallback", use_container_width=True, help="Navigate to Source Profiles section"):
-                    _set_nav("profiles")
-                    st.rerun()
-            
-            col_run, col_reset = st.columns([2, 1])
-        with col_run:
-            if st.button(
-                "▶ Execute Optimization",
-                type="primary",
-                use_container_width=True,
-                key="run_opt_btn_right",
-                help="Execute ML–TSSP batch optimization with current configuration (requires ML models)",
-                disabled=not button_enabled
-            ):
-                # Button logic is handled below in the execution section
-                pass
-            with col_reset:
-                reset_button_right = st.button("↺ Reset Configuration", use_container_width=True, key="reset_btn_right", help="Clear configuration and results")
-            
-            if reset_button_right:
-                st.session_state.results = None
-                st.session_state.sources = []
-                st.session_state["results_stale"] = False
-                st.session_state["_pending_recompute"] = False
-                st.session_state["_has_executed_optimization"] = False
-                st.session_state["last_rules_hash"] = None
-                st.session_state["last_update_time"] = None
-                _safe_rerun("reset configuration")
-            
-            st.divider()
-            
-            # ========== EXECUTION FEEDBACK & STATUS CONSOLE ==========
-            results = st.session_state.get("results")
-            if results is None:
+            with st.expander("🧠 Decision Optimization Engine", expanded=True):
+                # Data Mode Banner
+                if use_real_data:
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); 
+                                border-radius: 10px; padding: 0.8rem; margin-bottom: 1rem; 
+                                border: 2px solid #10b981; text-align: center;">
+                        <p style="margin: 0; font-size: 13px; font-weight: 700; color: #047857;">
+                            📊 REAL DATA MODE - Analyzing {len(sources)} Input Source(s)
+                        </p>
+                        <p style="margin: 0.3rem 0 0 0; font-size: 10px; color: #065f46;">
+                            Results based on your uploaded/entered data only
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                else:
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); 
+                                border-radius: 10px; padding: 0.8rem; margin-bottom: 1rem; 
+                                border: 2px solid #3b82f6; text-align: center;">
+                        <p style="margin: 0; font-size: 13px; font-weight: 700; color: #1e40af;">
+                            🎮 DEMO MODE - Analyzing {len(sources)} Generated Source(s)
+                        </p>
+                        <p style="margin: 0.3rem 0 0 0; font-size: 10px; color: #1e3a8a;">
+                            Using simulated data for demonstration
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
                 st.markdown("""
-                <div style="background: linear-gradient(135deg, #f0f9ff 0%, #f1fdf8 100%); padding: 1.5rem; border-radius: 12px; border: 2px dashed #bfdbfe; text-align: center;">
-                    <p style="margin: 0; font-size: 14px; color: #1e3a8a; font-weight: 600;">⏳ Ready for Optimization</p>
-                    <p style="margin: 0.5rem 0 0 0; font-size: 12px; color: #6b7280;">Click <strong>Execute Optimization</strong> to run ML–TSSP batch optimization (optimized for speed)</p>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown("""
-                <div style="background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); padding: 1.5rem; border-radius: 12px; border: 2px solid #a7f3d0;">
-                    <p style="margin: 0; font-size: 14px; color: #15803d; font-weight: 600;">✅ Optimization Complete</p>
-                    <p style="margin: 0.5rem 0 0 0; font-size: 12px; color: #1f2937;">Results ready for analysis. Review decision summary below.</p>
-                </div>
-                """, unsafe_allow_html=True)
-            
-            st.divider()
-            
-            # ========== EXECUTIVE DECISION SUMMARY ==========
-            st.markdown('<h4 style="color: #1e3a8a; margin-bottom: 1rem;">📊 Executive Decision Summary</h4>', unsafe_allow_html=True)
-
-            # Executive Summary MUST prefer local results (hard-block DB sync during same render cycle)
-            results = st.session_state.get("results")
-            if results is None:
-                st.info("Awaiting optimization run.")
-                return
-            # Do NOT call _sync_results_from_shared_db() here.
-
-            # === DEBUG STATUS BLOCK ===
-            with st.expander("🛠️ Debug Status (for troubleshooting)", expanded=True):
-                st.write({
-                    "results_present": st.session_state.get("results") is not None,
-                    "results_keys": list(st.session_state.get("results", {}).keys()) if st.session_state.get("results") else [],
-                    "sources_count": len(sources) if sources else 0,
-                    "pending_recompute": st.session_state.get("_pending_recompute"),
-                    "has_executed_optimization": st.session_state.get("_has_executed_optimization"),
-                    "refresh_token": st.session_state.get("refresh_token"),
-                    "last_consumed_refresh": st.session_state.get("last_consumed_refresh"),
-                    "results_stale": st.session_state.get("results_stale"),
-                    "parameters_changed": st.session_state.get("_parameters_changed"),
-                    "optimization_in_progress": st.session_state.get("_optimization_in_progress"),
-                })
-
-            results = st.session_state.get("results")
-            # Set safe defaults for summary variables
-            outcome_summary = "No optimization results available. Configure sources and run optimization."
-            
-            # Use pre-calculated summary if available (ensures sync)
-            if results and results.get("_summary_text"):
-                outcome_summary = f"Out of **{results.get('_n_all', 0)}** sources: {results.get('_summary_text')}."
-                
-            constraint_narrative = "No constraints applied. Awaiting optimization run."
-            emv_narrative = "No EMV improvement calculated. Run optimization to view results."
-            ml_emv_pct = uni_emv_pct = det_emv_pct = risk_reduction = 0.0
-
-            if results and not st.session_state.get("_pending_recompute") and len(sources) > 0:
-                # Render metrics/results using the latest results
-                ml_emv = results.get("emv", {}).get("ml_tssp", 0)
-                uni_emv = results.get("emv", {}).get("uniform", 0)
-                det_emv = results.get("emv", {}).get("deterministic", 0)
-                
-                # Use pre-calculated improvement if available
-                if "_risk_reduction" in results:
-                    risk_reduction = results["_risk_reduction"]
-                else:
-                    risk_reduction = ((uni_emv - ml_emv) / uni_emv * 100) if uni_emv > 0 else 0.0
-                
-                n_sources = max(len(sources), 1)
-                ml_emv_pct = emv_to_percent(ml_emv, n_sources=n_sources, lmax=1.0)
-                uni_emv_pct = emv_to_percent(uni_emv, n_sources=n_sources, lmax=1.0)
-                det_emv_pct = emv_to_percent(det_emv, n_sources=n_sources, lmax=1.0)
-
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    render_kpi_indicator("Total Sources", len(sources), note="Input pool", number_font_size=13, key="kpi_total_sources_exec")
-                with col2:
-                    render_kpi_indicator(
-                        "Risk (EMV)",
-                        ml_emv_pct,
-                        reference=uni_emv_pct,
-                        suffix="%",
-                        note="vs Uniform",
-                        number_font_size=13,
-                        key="kpi_risk_exec"
-                    )
-                with col3:
-                    ml = results.get("policies", {}).get("ml_tssp", [])
-                    assignable = (SOURCE_STATE_ASSIGNED, SOURCE_STATE_ASSIGNED_ESCALATED)
-                    assigned_only = [a for a in ml if a.get("source_state") in assignable]
-                    low_assigned = sum(1 for a in assigned_only if a.get("risk_bucket") == "low")
-                    n_assigned = len(assigned_only)
-                    render_kpi_indicator("Low Risk Assigned", low_assigned, note=f"n={n_assigned} assigned", number_font_size=13, key="kpi_low_risk_exec")
-                with col4:
-                    render_kpi_indicator("Improvement", risk_reduction, suffix="%", note="Vs baseline", number_font_size=13, key="kpi_improvement_exec")
-                
-                # PROFESSIONAL STABILITY FIX: Define these variables inside the results block
-                ml = results.get("policies", {}).get("ml_tssp", [])
-                recommended_disengage = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_RECOMMENDED_DISENGAGEMENT)
-                assigned_esc = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_ASSIGNED_ESCALATED)
-                assigned_normal = sum(1 for a in ml if a.get("source_state") == SOURCE_STATE_ASSIGNED)
-                n_all = len(ml)
-
-                outcome_parts = []
-                if recommended_disengage > 0:
-                    outcome_parts.append(f"<strong>{recommended_disengage}</strong> sources recommended for disengagement (high risk)")
-                if assigned_esc > 0:
-                    outcome_parts.append(f"<strong>{assigned_esc}</strong> assigned with escalation (medium risk or quality concerns)")
-                if assigned_normal > 0:
-                    outcome_parts.append(f"<strong>{assigned_normal}</strong> assigned under normal handling (low risk, good quality)")
-
-                if len(outcome_parts) == 0:
-                    outcome_summary = f"All <strong>{n_all}</strong> sources processed."
-                elif len(outcome_parts) == 1:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}."
-                elif len(outcome_parts) == 2:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]} and {outcome_parts[1]}."
-                else:
-                    outcome_summary = f"Out of <strong>{n_all}</strong> sources, {outcome_parts[0]}, {outcome_parts[1]}, and {outcome_parts[2]}."
-
-                # Constraint impact narrative
-                if recommended_disengage > 0:
-                    constraint_narrative = f"Risk-based constraints excluded <strong>{recommended_disengage}</strong> high-risk sources from operational assignment. Medium-risk sources with quality concerns receive escalated oversight. Low-risk sources with acceptable performance operate under standard protocols."
-                elif assigned_esc > 0:
-                    constraint_narrative = f"Risk thresholds triggered escalation for <strong>{assigned_esc}</strong> sources with quality or uncertainty concerns. No sources meet high-risk disengagement criteria under current thresholds."
-                else:
-                    constraint_narrative = "All sources meet operational quality standards under current risk thresholds. No escalation or disengagement required."
-
-                # EMV narrative
-                if recommended_disengage > 0:
-                    emv_narrative = f"Disengaged sources (<strong>{recommended_disengage}</strong>) contribute zero EMV by policy, representing controlled opportunity cost. The <strong>{risk_reduction:.1f}%</strong> improvement reflects strategic risk avoidance—accepting {recommended_disengage} missed opportunities to prevent exposure to high-risk intelligence."
-                else:
-                    emv_narrative = f"The <strong>{risk_reduction:.1f}%</strong> improvement reflects optimized assignment quality and risk-aware task allocation, achieved without source disengagement."
-            
-            elif st.session_state.get("_pending_recompute"):
-                st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in the Decision Optimization Engine above to generate new results.")
-            elif len(sources) == 0:
-                st.session_state["results"] = None
-                st.session_state["_pending_recompute"] = False
-                st.session_state["_has_executed_optimization"] = False
-                st.info("No sources available. Add demo sources or upload real data to run optimization.")
-                st.stop()
-            else:
-                # Pre-optimization state
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    st.metric("Sources Configured", len(sources))
-                with col2:
-                    st.metric("Expected Risk", "—")
-                with col3:
-                    st.metric("Improvement vs Uniform", "—")
-                st.markdown(f"""
-                <div style='background: #f8fafc; border-left: 3px solid #94a3b8; padding: 0.8rem 1rem; border-radius: 6px; margin-top: 1rem;'>
-                    <p style='margin: 0; font-size: 12px; color: #475569; line-height: 1.6;'>
-                        <strong>Status:</strong> {len(sources)} sources configured and awaiting optimization. 
-                        Execute the ML-TSSP algorithm to determine optimal task assignments based on reliability thresholds 
-                        (disengage: {st.session_state.recourse_rules['rel_disengage']:.2f}, flag: {st.session_state.recourse_rules['rel_ci_flag']:.2f}) 
-                        and deception constraints (reject: {st.session_state.recourse_rules['dec_disengage']:.2f}, escalate: {st.session_state.recourse_rules['dec_ci_flag']:.2f}).
+                <div style="background:linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);border-radius:15px;padding:1.8rem;
+                            box-shadow:0 4px 15px rgba(0,0,0,0.12);border:1px solid #cbd5e1;
+                            border-top:4px solid #10b981;">
+                    <h3 class="section-header" style="margin-top:0;color:#047857;">🧠 Decision Optimization Engine</h3>
+                    <p style="text-align:center;color:#475569;font-size:13px;margin:0 0 1.2rem 0;">
+                        Configure parameters and execute the ML–TSSP optimization algorithm
                     </p>
-                </div>
                 """, unsafe_allow_html=True)
-            
-            # PROFESSIONAL STABILITY FIX: Always render summary box if we have results
-            if results and outcome_summary:
+
+                # ========== OPTIMIZATION ACTION BAR (GROUPED) ==========
+                can_execute_optimization = has_permission("execute_optimization")
+                models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, 'models_loaded') and _ml_pipeline.models_loaded
+                button_enabled = can_execute_optimization and models_available
+
+                if not can_execute_optimization:
+                    st.info("Optimization execution is restricted for your role.")
+                elif not models_available:
+                    st.error("❌ ML-TSSP models are not loaded. Optimization cannot run. Please ensure ML models are properly initialized.")
+
+                # Safe navigation fallback for analysts (if radio widget state desyncs)
+                if can_execute_optimization and nav_key != "profiles":
+                    if st.button("📋 Navigate to Source Profiles", key="nav_to_profiles_fallback", use_container_width=True, help="Navigate to Source Profiles section"):
+                        _set_nav("profiles")
+                        st.rerun()
+
+                # Command-center style action bar
+                action_col1, action_col2 = st.columns([3, 1], gap="small")
+                with action_col1:
+                    run_button = st.button(
+                        "▶ Execute Optimization",
+                        type="primary",
+                        use_container_width=True,
+                        key="run_opt_btn_right",
+                        help="Execute ML–TSSP batch optimization with current configuration (requires ML models)",
+                        disabled=not button_enabled
+                    )
+                    if run_button:
+                        if "sources_df" not in st.session_state:
+                            st.error("Please upload a source data file first.")
+                            st.stop()
+                        df = st.session_state["sources_df"]
+                        assert df["source_id"].is_unique, "source_id must be unique per source"
+                        # Build sources from DataFrame
+                        sources = []
+                        current_rules = st.session_state.get("recourse_rules") or {
+                            "rel_disengage": 0.35, "rel_ci_flag": 0.50,
+                            "dec_disengage": 0.75, "dec_ci_flag": 0.60,
+                        }
+                        for _, row in df.iterrows():
+                            features = {col: row[col] for col in df.columns if col != "source_id"}
+                            sources.append({
+                                "source_id": row["source_id"],
+                                "features": features,
+                                "reliability_series": [],
+                                "recourse_rules": current_rules,
+                            })
+                        payload = {"sources": sources, "seed": 42}
+                        output = run_optimization(payload)
+                        
+                        # Extract counts from the policies
+                        policies = output.get("policies", {}).get("ml_tssp", [])
+                        n_high = sum(1 for p in policies if p.get("risk_bucket") == "high")
+                        n_medium = sum(1 for p in policies if p.get("risk_bucket") == "medium") 
+                        n_low = sum(1 for p in policies if p.get("risk_bucket") == "low")
+                        
+                        # Calculate EMV improvement
+                        emv_values = output.get("emv", {})
+                        ml_emv = emv_values.get("ml_tssp", 0)
+                        det_emv = emv_values.get("deterministic", 0)
+                        uni_emv = emv_values.get("uniform", 0)
+                        
+                        # EMV percentage improvement over deterministic baseline
+                        baseline_emv = det_emv  # Use deterministic as primary baseline
+                        if baseline_emv > 0:
+                            emv_pct = ((ml_emv - baseline_emv) / baseline_emv) * 100
+                        else:
+                            emv_pct = 0
+                        
+                        # Improvement percentage (how much better than uniform random)
+                        if uni_emv > 0:
+                            improvement_pct = ((uni_emv - ml_emv) / uni_emv) * 100
+                        else:
+                            improvement_pct = 0
+                        
+                        # Store full optimization results for source profiles and tasking sections
+                        # Ensure source_state and risk_bucket are set in all policies
+                        if output and "policies" in output:
+                            for policy_name, policy_list in output["policies"].items():
+                                _ensure_source_state_and_risk_bucket(policy_list)
+                        st.session_state["results"] = output
+                        st.session_state["sources"] = sources  # Store the processed sources
+                        st.session_state["results_stale"] = False
+                        st.session_state["last_update_time"] = datetime.now().strftime("%H:%M:%S")
+                        st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+                        st.session_state["_has_executed_optimization"] = True
+                        
+                        st.session_state["final_results"] = {
+                            "total_sources": len(df),
+                            "disengaged": n_high,
+                            "escalated": n_medium,
+                            "normal": n_low,
+                            "assigned_total": n_medium + n_low,
+                            "emv_pct": emv_pct,
+                            "improvement_pct": improvement_pct,
+                        }
+                        st.write("DEBUG final_results:", st.session_state["final_results"])
+                        r = st.session_state["final_results"]
+                        assert r["disengaged"] + r["escalated"] + r["normal"] == r["total_sources"]
+                with action_col2:
+                    reset_button = st.button(
+                        "↺ Reset Configuration",
+                        use_container_width=True,
+                        key="reset_btn_right",
+                        help="Clear configuration and results"
+                    )
+
+                if reset_button:
+                    st.session_state.results = None
+                    st.session_state.sources = []
+                    st.session_state["results_stale"] = False
+                    st.session_state["_pending_recompute"] = False
+                    st.session_state["_has_executed_optimization"] = False
+                    st.session_state["last_rules_hash"] = None
+                    st.session_state["last_update_time"] = None
+                    _safe_rerun("reset configuration")
+
+                st.divider()
+
+                # ========== EXECUTIVE DECISION SUMMARY (NO HARDCODED NUMBERS, NO RECOMPUTATION) ==========
+                st.markdown('<h4 style="color: #1e3a8a; margin-bottom: 1rem;">📊 Executive Decision Summary</h4>', unsafe_allow_html=True)
+
+                r = st.session_state.get("final_results")
+                if r is None:
+                    st.info("Awaiting optimization run.")
+                    return
+
+                # Full-width KPI row (no math, just reads)
+                kpi_cols = st.columns(4, gap="large")
+                with kpi_cols[0]:
+                    render_kpi_indicator("Total Sources", r["total_sources"], note="Input pool", number_font_size=13, key="kpi_total_sources_exec")
+                with kpi_cols[1]:
+                    render_kpi_indicator("Disengaged (High Risk)", r["disengaged"], note="Excluded", number_font_size=13, key="kpi_disengaged_exec")
+                with kpi_cols[2]:
+                    render_kpi_indicator("Escalated (Medium Risk)", r["escalated"], note="Oversight", number_font_size=13, key="kpi_escalated_exec")
+                with kpi_cols[3]:
+                    render_kpi_indicator("Low Risk Assigned", r["normal"], note=f"n={r['assigned_total']} assigned", number_font_size=13, key="kpi_low_risk_exec")
+
+                # Executive summary box (no hardcoded numbers)
                 st.markdown(f"""
                 <div style='
                     background: linear-gradient(135deg, #f8fafc 0%, #ecfdf5 100%);
@@ -8885,76 +7733,19 @@ def render_streamlit_app():
                 '>
                     <p style='margin: 0 0 0.65rem 0; font-size: 13px; color: #0f172a; line-height: 1.65; max-width: 100%;'>
                         <span style='display:inline-block;font-weight:800;color:#064e3b;letter-spacing:0.2px;'>Decision Outcome</span><br/>
-                        {outcome_summary} The optimized portfolio achieves <strong>{ml_emv_pct:.2f}%</strong> of worst‑case EMV, outperforming uniform (<strong>{uni_emv_pct:.2f}%</strong>) and deterministic (<strong>{det_emv_pct:.2f}%</strong>) baselines by <strong>{risk_reduction:.1f}%</strong>.
+                        Out of <strong>{r['total_sources']}</strong> sources, <strong>{r['disengaged']}</strong> were recommended for disengagement (high risk), <strong>{r['escalated']}</strong> assigned with escalation, and <strong>{r['normal']}</strong> assigned under normal handling.
                     </p>
                     <p style='margin: 0 0 0.65rem 0; font-size: 13px; color: #334155; line-height: 1.65; max-width: 100%;'>
                         <span style='display:inline-block;font-weight:800;color:#065f46;letter-spacing:0.2px;'>Constraint Impact</span><br/>
-                        {constraint_narrative}
+                        Risk-based constraints excluded <strong>{r['disengaged']}</strong> high-risk sources from operational assignment. Medium-risk sources with quality concerns receive escalated oversight. Low-risk sources with acceptable performance operate under standard protocols.
                     </p>
                     <p style='margin: 0; font-size: 13px; color: #334155; line-height: 1.65; max-width: 100%;'>
-                        <span style='display:inline-block;font-weight:800;color:#065f46;letter-spacing:0.2px;'>EMV and Improvement</span><br/>
-                        {emv_narrative}
+                        <span style='display:inline-block;font-weight:800;color:#065f46;letter-spacing:0.2px;'>ML-TSSP Advantage</span><br/>
+                        ML-TSSP demonstrates a <strong>{r['emv_pct']:.1f}%</strong> improvement in Expected Mission Value (EMV) relative to the deterministic baseline and a <strong>{abs(r['improvement_pct']):.1f}%</strong> reduction in EMV loss compared to uniform allocation, driven by machine-learning–based risk assessment and second-stage stochastic optimization.
                     </p>
                 </div>
                 """, unsafe_allow_html=True)
-                
-                st.markdown('</div>', unsafe_allow_html=True)
-
-        # ========== RUN OPTIMIZATION EXECUTION ==========
-        if st.session_state.get("run_opt_btn_right"):
-            # Consume the click immediately to prevent re-execution on rerun
-            # But we don't use _consume_button_click here because we want to handle it manually
-            if st.session_state.get("_optimization_in_progress"):
-                st.info("Optimization is already running.")
-            else:
-                st.session_state["_optimization_in_progress"] = True
-                payload = {"sources": sources, "seed": 42}
-                # #region agent log
-                rr = st.session_state.get("recourse_rules") or {}
-                src0_rr = (sources[0].get("recourse_rules") if sources else None) or {}
-                _debug_log("dashboard.py:run_opt", "run_optimization called", {"n_sources": len(sources), "session_recourse_rules": rr, "first_source_has_recourse_rules": bool(sources and sources[0].get("recourse_rules")), "first_source_rr_keys": list(src0_rr.keys()) if src0_rr else []}, "H5")
-                # #endregion
-                try:
-                    n_sources = len(sources) if sources else 0
-                    if n_sources == 0:
-                        st.error("No sources available. Upload/validate data before running optimization.")
-                        st.session_state["results"] = None
-                        st.session_state["_has_executed_optimization"] = False
-                        st.session_state["_pending_recompute"] = True
-                    else:
-                        # Check ML models if using local API
-                        if USE_LOCAL_API:
-                            models_available = MODULAR_PIPELINE_AVAILABLE and _ml_pipeline and hasattr(_ml_pipeline, "models_loaded") and _ml_pipeline.models_loaded
-                            if not models_available:
-                                st.error("ML models are not loaded. Optimization cannot run.")
-                                st.session_state["results"] = None
-                                st.session_state["_has_executed_optimization"] = False
-                                st.session_state["_pending_recompute"] = True
-                            else:
-                                # Proceed with optimization
-                                _run_optimization_execution(sources, n_sources, payload, username, role)
-                        else:
-                            # Backend API path - proceed with optimization
-                            _run_optimization_execution(sources, n_sources, payload, username, role)
-                except RuntimeError as e:
-                    # ML models required error
-                    st.error(f"❌ ML-TSSP Optimization Failed: {e}")
-                    st.warning("""
-                    **ML-TSSP Models Required**
-                    
-                    The system requires ML-TSSP models (XGBoost + GRU) to operate. 
-                    Formula-based optimization is no longer supported.
-                    
-                    Please ensure:
-                    - ML model files are present in the models directory
-                    - ML pipeline is properly initialized
-                    - Models are loaded successfully
-                    """)
-                except Exception as e:
-                    st.error(f"❌ Optimization failed: {e}")
-                    st.exception(e)
-                finally:
-                    st.session_state["_optimization_in_progress"] = False
+                # End of summary box
 
     # ======================================================
     # 1.5. WORKFLOW ACTIONS (Multi-User Interconnected)
@@ -9083,7 +7874,7 @@ def render_streamlit_app():
                         st.markdown(f"""
                         <div style='background: #f8fafc; border-left: 3px solid {status_color}; border-radius: 6px; padding: 0.6rem; margin-bottom: 0.5rem;'>
                             <p style='margin: 0; font-size: 12px; font-weight: 600; color: #1e293b;'>
-                                {req['source_id']} → {req['requested_task']} 
+                                {req['source_id']} -> {req['requested_task']} 
                                 <span style='color: {status_color};'>({req['status'].upper()})</span>
                             </p>
                             {f"<p style='margin: 0.3rem 0 0 0; font-size: 10px; color: #64748b;'>Approved by: {req['approved_by']} on {req['approved_at']}</p>" if req['approved_by'] else ""}
@@ -9227,10 +8018,10 @@ def render_streamlit_app():
                 pass
             # #endregion
             st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in Source Profiles to generate new results.")
-        st.markdown("""<h3 class="section-header">📈 Policy Insights - Comparative Policy Evaluation</h3>
+        st.markdown("""<h3 class="section-header">Policy Insights - Comparative Policy Evaluation</h3>
         <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
-            Comprehensive analysis of ML–TSSP optimization results with policy comparisons and sensitivity assessments.
-            <strong>✨ All sections (Analyst, Executive, Oversight) update dynamically when parameters change.</strong>
+            Comprehensive analysis of ML-TSSP optimization results with policy comparisons and sensitivity assessments.
+            <strong>All sections (Analyst, Executive, Oversight) update dynamically when parameters change.</strong>
         </p>""", unsafe_allow_html=True)
         
         # Safe navigation fallback for analysts to access Source Profiles
@@ -9397,21 +8188,22 @@ def render_streamlit_app():
             # #endregion
             # Show message that inputs changed - user must use Execute Optimization button
             st.info("⚠️ **Inputs changed.** Results have been cleared. Use **Execute Optimization** in Source Profiles to generate new results.")
-        st.markdown("""<h3 class="section-header">💰 EVPI Focus - Expected Value of Perfect Information</h3>
-        <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
-            Quantify the marginal value of eliminating source behavior uncertainty through perfect information acquisition.
-            <strong>Updates dynamically when parameters change.</strong>
-        </p>
-        <div style='background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); 
-                    padding: 1rem; border-radius: 8px; border-left: 4px solid #3b82f6; 
-                    margin-bottom: 1.5rem;'>
-            <p style='margin: 0; font-size: 12px; color: #1e3a8a; line-height: 1.6;'>
-                <strong>Decision Context:</strong> EVPI measures the maximum justifiable cost of obtaining perfect foreknowledge 
-                about each source's true reliability and deception risk. High EVPI indicates that current uncertainty 
-                materially degrades decision quality—these sources warrant enhanced vetting, corroboration, or collection investment. 
-                Low EVPI suggests the ML model has already extracted actionable signal from available data.
-            </p>
-        </div>
+        st.markdown("""
+<h3 class="section-header">EVPI Focus - Expected Value of Perfect Information</h3>
+<p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
+    Quantify the marginal value of eliminating source behavior uncertainty through perfect information acquisition.
+    <strong>Updates dynamically when parameters change.</strong>
+</p>
+<div style='background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%); 
+            padding: 1rem; border-radius: 8px; border-left: 4px solid #3b82f6; 
+            margin-bottom: 1.5rem;'>
+    <p style='margin: 0; font-size: 12px; color: #1e3a8a; line-height: 1.6;'>
+        <strong>Decision Context:</strong> EVPI measures the maximum justifiable cost of obtaining perfect foreknowledge 
+        about each source's true reliability and deception risk. High EVPI indicates that current uncertainty 
+        materially degrades decision quality—these sources warrant enhanced vetting, corroboration, or collection investment. 
+        Low EVPI suggests the ML model has already extracted actionable signal from available data.
+    </p>
+</div>
         """, unsafe_allow_html=True)
         ml_policy = results.get("policies", {}).get("ml_tssp", [])
         uni_policy = results.get("policies", {}).get("uniform", [])
@@ -9915,11 +8707,14 @@ def render_streamlit_app():
             """, unsafe_allow_html=True)
             
             # Build source list from actual optimization data (single source of truth)
-            actual_sources = st.session_state.get("sources") or sources
+            actual_sources = st.session_state.get("sources") or []
             display_sources = _filter_sources_for_role(actual_sources, username, role)
             if role == "case_officer" and not display_sources:
                 st.info("No assigned sources available for this handler.")
             results = st.session_state.get("results")
+            if results:
+                ml_policy = results.get("policies", {}).get("ml_tssp", [])
+                _ensure_source_state_and_risk_bucket(ml_policy)
             sources_list = []
             for idx, source in enumerate(display_sources):
                 src_id = source.get("source_id", f"SRC_{idx + 1:03d}")
@@ -9941,6 +8736,9 @@ def render_streamlit_app():
                         task_assign = str(match.get("task", "—"))
                         source_state = match.get("source_state")
                         risk_bucket = match.get("risk_bucket")
+                    else:
+                        # Source not found in optimization results
+                        pass
                 if risk_bucket is None and intrinsic_risk is not None:
                     try:
                         risk_bucket = _risk_bucket_from_intrinsic(float(intrinsic_risk))
@@ -9981,7 +8779,7 @@ def render_streamlit_app():
                 st.session_state.risk_filter_levels = ["Low", "Medium", "High"]
             st.markdown("<p style='margin:0.2rem 0 0.4rem 0; font-size:11px; color:#475569; font-weight:600;'>Risk filter</p>", unsafe_allow_html=True)
             selected_levels = st.multiselect(
-                "",
+                "Filter by risk level",
                 ["Low", "Medium", "High"],
                 default=st.session_state.risk_filter_levels,
                 key="risk_filter_levels",
@@ -10047,7 +8845,7 @@ def render_streamlit_app():
         
         # ========== RIGHT PANEL: DETAILED SOURCE PROFILE ==========
         with source_profile_col:
-            actual_sources = st.session_state.get("sources") or sources
+            actual_sources = st.session_state.get("sources") or []
             results = st.session_state.get("results")
             selected_idx = st.session_state.selected_source_idx
             display_sources = _filter_sources_for_role(actual_sources, username, role)
@@ -10527,7 +9325,7 @@ def render_streamlit_app():
                         - Intrinsic Risk: {intrinsic_disp}
                         - Expected Risk (post-recourse): {expected_disp}
                         - Source State: {source_state_disp}
-                        - <span style='color: {score_color}; font-weight: 700;'>Optimization Score: {opt_score:.1f} ({score_label})</span>
+                        - <span style='color: {score_color}; font-weight: 700;'>Optimization Score: {opt_score:.1f}% ({score_label})</span>
                         *Score (0–100 scale) combines: Risk 40%, Task Success 25%, Corroboration 20%, Timeliness 15%*
                         """, unsafe_allow_html=True)
                 feat_upd = {

@@ -95,22 +95,7 @@ def submit_job(payload: Dict[str, Any], bg: BackgroundTasks):
             role = payload.get("role") or "system"
             try:
                 save_optimization_results(result, sources, created_by=username)
-                sources_map = {s.get("source_id"): s for s in sources if s.get("source_id") is not None}
-                ml_policy = result.get("policies", {}).get("ml_tssp", [])
-                sources_batch = []
-                assignments_batch = []
-                for assignment in ml_policy:
-                    source_id = assignment.get("source_id")
-                    if source_id:
-                        src = sources_map.get(source_id)
-                        if src:
-                            sources_batch.append((source_id, src.get("features", {}), src.get("recourse_rules", {})))
-                        assignments_batch.append((source_id, assignment))
-                if sources_batch:
-                    batch_save_sources(sources_batch, username)
-                if assignments_batch:
-                    batch_save_assignments(assignments_batch, "ml_tssp", username)
-                log_audit(username, role, "run_optimization", "optimization", "batch",
+                log_audit(username, role, "run_optimization", "optimization", "save",
                           {"n_sources": len(sources), "using_ml": result.get("_using_ml_models", False)})
             except Exception as e:
                 with JOBS_LOCK:

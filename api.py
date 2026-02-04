@@ -71,8 +71,10 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
     rng = np.random.default_rng(seed)
     
     policies = {"ml_tssp": [], "deterministic": [], "uniform": []}
-    # Deterministic and Uniform models are Stage 1-only baselines.
-    # They do not use ML predictions or progress to Stage 2 (no adaptive optimization).
+    # IMPORTANT: Each model makes independent decisions based on its own risk assessments
+    # ML-TSSP: Uses ML predictions + Stage 2 optimization
+    # Deterministic: Uses fixed risk assumptions + Stage 1 decisions only
+    # Uniform: Uses equal probability assumptions + Stage 1 decisions only
     
     # Check if ML pipeline is available and loaded
     use_ml_models = (
@@ -118,20 +120,20 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         # Batch predictions (much faster than per-source)
         if hasattr(ml_pipeline, 'predict_batch_reliability_scores'):
             # Use batch prediction methods if available
-            reliability_scores = ml_pipeline.predict_batch_reliability_scores(features_dicts)
-            deception_scores = ml_pipeline.predict_batch_deception_scores(features_dicts)
+            reliability_scores_batch = ml_pipeline.predict_batch_reliability_scores(features_dicts)
+            deception_scores_batch = ml_pipeline.predict_batch_deception_scores(features_dicts)
             behavior_probs_list = ml_pipeline.predict_batch_behavior_probabilities(features_dicts)
         else:
             # Fallback to per-source predictions (slower but works)
-            reliability_scores = []
-            deception_scores = []
+            reliability_scores_batch = []
+            deception_scores_batch = []
             behavior_probs_list = []
             for features_dict in features_dicts:
-                reliability_scores.append(ml_pipeline.predict_reliability_score(features_dict))
-                deception_scores.append(ml_pipeline.predict_deception_score(features_dict))
+                reliability_scores_batch.append(ml_pipeline.predict_reliability_score(features_dict))
+                deception_scores_batch.append(ml_pipeline.predict_deception_score(features_dict))
                 behavior_probs_list.append(ml_pipeline.predict_behavior_probabilities(features_dict))
-            reliability_scores = np.array(reliability_scores)
-            deception_scores = np.array(deception_scores)
+            reliability_scores_batch = np.array(reliability_scores_batch)
+            deception_scores_batch = np.array(deception_scores_batch)
         
         ml_models_used = True
         
@@ -143,33 +145,66 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         ) from e
     
     # ===================================================================
-    # STEP 2: Prepare TSSP optimization inputs from ML predictions
+    # STEP 1: Calculate reliability and deception scores
     # ===================================================================
-    # Extract source IDs and prepare TSSP inputs
-    source_ids = [s.get("source_id") for s in sources]
-    tasks = TASK_ROSTER.copy()
-    behavior_classes = [b.title() for b in BEHAVIOR_CLASSES]  # Capitalize for TSSP
-    
-    # Prepare behavior probabilities: Dict[(source_id, behavior_class), probability]
-    behavior_probabilities = {}
+    # ML-TSSP uses actual ML predictions
+    # Baselines use formula-based calculations (simulating what ML would predict)
+    reliability_scores = {}
+    deception_scores = {}
+    behavior_probs_dict = {}
+    tasks = TASK_ROSTER.copy()  # Define tasks here for use in STEP 1
+    behavior_classes = [b.title() for b in BEHAVIOR_CLASSES]  # Define behavior_classes here for use in STEP 1
+
     for idx, source in enumerate(sources):
         source_id = source.get("source_id")
-        behavior_probs_lower = behavior_probs_list[idx]
-        behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
-        
-        # Map to TSSP format with capitalized behavior names
-        for behavior_lower, prob in behavior_probs_ml.items():
-            behavior_capitalized = behavior_lower.title()
-            if behavior_capitalized in behavior_classes:
-                behavior_probabilities[(source_id, behavior_capitalized)] = float(prob)
+        features = source.get("features", {})
+
+        # Extract features
+        tsr = features.get("task_success_rate", 0.5)
+        cor = features.get("corroboration_score", 0.5)
+        time = features.get("report_timeliness", 0.5)
+        handler = features.get("handler_confidence", 0.5)
+        dec_score = features.get("deception_score", 0.3)
+        ci = features.get("ci_flag", 0)
+
+        # ML-TSSP: Use actual ML predictions from batch results
+        reliability_scores[source_id] = float(reliability_scores_batch[idx])
+        deception_scores[source_id] = float(deception_scores_batch[idx])
+        behavior_probs_dict[source_id] = {k.lower(): float(v) for k, v in behavior_probs_list[idx].items()}
+
+        # Deterministic: Use formula-based calculation (simulating ML prediction)
+        det_reliability = np.clip(
+            0.30 * tsr + 0.25 * cor + 0.20 * time + 0.15 * handler
+            - 0.15 * dec_score - 0.10 * ci + 0.05 * rng.normal(0, 0.03),
+            0.0, 1.0
+        )
+        det_deception = np.clip(
+            0.30 * dec_score + 0.25 * ci + 0.20 * (1 - cor) + 0.15 * (1 - handler)
+            + 0.10 * rng.beta(2, 5),
+            0.0, 1.0
+        )
+        reliability_scores[f"{source_id}_deterministic"] = float(det_reliability)
+        deception_scores[f"{source_id}_deterministic"] = float(det_deception)
+        # Deterministic uses fixed moderate risk assumption (no behavior modeling)
+        behavior_probs_dict[f"{source_id}_deterministic"] = {
+            "cooperative": 0.4, "uncertain": 0.3, "coerced": 0.2, "deceptive": 0.1
+        }
+
+        # Uniform: Use same formula-based calculation as deterministic
+        reliability_scores[f"{source_id}_uniform"] = float(det_reliability)
+        deception_scores[f"{source_id}_uniform"] = float(det_deception)
+        # Uniform assumes equal probability for all behaviors
+        behavior_probs_dict[f"{source_id}_uniform"] = {
+            "cooperative": 0.25, "uncertain": 0.25, "coerced": 0.25, "deceptive": 0.25
+        }
     
     # Calculate Stage 1 costs: cost of assigning source to task
     # Cost = 1 - (reliability * (1 - deception)) = risk of assignment
     stage1_costs = {}
     for idx, source in enumerate(sources):
         source_id = source.get("source_id")
-        reliability = float(reliability_scores[idx])
-        deception = float(deception_scores[idx])
+        reliability = float(reliability_scores[source_id])
+        deception = float(deception_scores[source_id])
         # Cost is inverse of quality: higher reliability and lower deception = lower cost
         assignment_quality = reliability * (1 - deception)
         assignment_cost = 1.0 - assignment_quality  # Cost increases as quality decreases
@@ -186,18 +221,46 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         recourse_costs[behavior] = float(risk)
     
     # ===================================================================
-    # STEP 3: Build and solve TSSP optimization model
+    # STEP 2: Process each model separately
     # ===================================================================
-    # TSSP optimization with ML predictions
-    # Use TSSP for smaller problems, fallback to decision logic for larger ones to prevent hanging
+
+    # Process ML-TSSP (uses actual ML predictions + Stage 2 optimization)
+    source_ids = [s.get("source_id") for s in sources]
+
+    # ML-TSSP behavior probabilities
+    behavior_probabilities = {}
+    for idx, source in enumerate(sources):
+        source_id = source.get("source_id")
+        behavior_probs_ml = behavior_probs_dict[source_id]
+        for behavior_lower, prob in behavior_probs_ml.items():
+            behavior_capitalized = behavior_lower.title()
+            if behavior_capitalized in behavior_classes:
+                behavior_probabilities[(source_id, behavior_capitalized)] = float(prob)
+
+    # Calculate Stage 1 costs for ML-TSSP
+    stage1_costs = {}
+    for idx, source in enumerate(sources):
+        source_id = source.get("source_id")
+        reliability = reliability_scores[source_id]
+        deception = deception_scores[source_id]
+        assignment_quality = reliability * (1 - deception)
+        assignment_cost = 1.0 - assignment_quality
+        for task in tasks:
+            stage1_costs[(source_id, task)] = float(np.clip(assignment_cost, 0.0, 1.0))
+
+    # Calculate recourse costs
+    recourse_costs = {}
+    for behavior in behavior_classes:
+        behavior_lower = behavior.lower()
+        risk = BEHAVIOR_RISK_MAP.get(behavior_lower, 0.5)
+        recourse_costs[behavior] = float(risk)
+
+    # ML-TSSP optimization (Stage 1 + Stage 2)
     tssp_assignments = None
-    # Reduce TSSP usage to smaller problems to prevent hanging - can be increased if solver performance improves
-    # Limit to 20 sources for faster response times
     use_tssp = TSSP_AVAILABLE and TSSPModel is not None and len(sources) <= 20
-    
+
     if use_tssp:
         try:
-            # Quick check: if problem is too large, skip TSSP immediately
             if len(sources) > 20 or len(tasks) > 20:
                 tssp_assignments = None
             else:
@@ -209,62 +272,27 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
                     stage1_costs=stage1_costs,
                     recourse_costs=recourse_costs
                 )
-                
-                # Build the model (this should be fast)
+
                 tssp_model.build_model()
-                
-                # Solve the optimization problem with aggressive timeout protection
-                # Try CBC first (faster), fallback to GLPK
-                # Use 10 second timeout - TSSP should solve quickly for small problems
                 solver_success = False
-                solver_error = None
                 for solver_name in ['cbc', 'glpk']:
                     try:
-                        # #region agent log
-                        try:
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "api.py:solver_loop", "message": "Attempting solver", "data": {"solver": solver_name, "n_sources": len(sources)}, "timestamp": int(_time_log.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
-                        except: pass
-                        # #endregion
-                        # Use short timeout to prevent UI hanging
                         solver_success = tssp_model.solve(solver_name=solver_name, verbose=False, timelimit=10)
-                        # #region agent log
-                        try:
-                            with open(r"d:\Updated-FINAL DASH\.cursor\debug.log", "a", encoding="utf-8") as _f:
-                                _f.write(_json_log.dumps({"location": "api.py:solver_loop", "message": "Solver result", "data": {"solver": solver_name, "success": solver_success}, "timestamp": int(_time_log.time() * 1000), "sessionId": "debug-session", "runId": "run1", "hypothesisId": "H1"}) + "\n")
-                        except: pass
-                        # #endregion
                         if solver_success:
                             break
-                    except Exception as e:
-                        solver_error = str(e)
+                    except Exception:
                         continue
-                    except KeyboardInterrupt:
-                        # Handle interruption gracefully
-                        solver_error = "Solver interrupted"
-                        break
-                
-                if not solver_success:
-                    # Silently fall back to decision logic - don't warn to avoid cluttering UI
-                    tssp_assignments = None
-                else:
-                    # Extract TSSP solution
+
+                if solver_success:
                     tssp_solution = tssp_model.solution
-                    if tssp_solution is not None and tssp_solution.get('status') == 'optimal':
-                        # Extract assignments from TSSP solution
+                    if tssp_solution and tssp_solution.get('status') == 'optimal':
                         tssp_assignments = tssp_solution.get('assignments', {})
-                    else:
-                        # Silently skip TSSP and use decision logic
-                        tssp_assignments = None
-        
-        except Exception as e:
-            # If TSSP fails, silently fall back to decision logic (but still use ML predictions)
+                else:
+                    tssp_assignments = None
+        except Exception:
             tssp_assignments = None
-    
-    # ===================================================================
-    # STEP 4: Map TSSP assignments to policy format
-    # ===================================================================
-    # Create mapping from source_id to TSSP assignment
+
+    # Create TSSP assignment mapping
     source_to_task = {}
     if tssp_assignments:
         for (source_id, task), assigned in tssp_assignments.items():
@@ -276,8 +304,8 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         source_id = source.get("source_id")
         
         # Get pre-computed ML predictions
-        reliability = float(reliability_scores[idx])
-        deception = float(deception_scores[idx])
+        reliability = float(reliability_scores[source_id])
+        deception = float(deception_scores[source_id])
         behavior_probs_lower = behavior_probs_list[idx]
         behavior_probs_ml = {k.lower(): v for k, v in behavior_probs_lower.items()}
         
@@ -324,7 +352,7 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             # Check if quality thresholds require disengagement despite TSSP assignment
             if risk_bucket == "high" or deception >= dec_disengage or reliability < rel_disengage:
                 action = "disengage"
-                task = None
+                # Keep TSSP-assigned task even for disengagement recommendations
             elif deception >= dec_flag:
                 action = "flag_for_ci"
                 # Keep TSSP-assigned task
@@ -338,10 +366,10 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             # Fallback to decision logic (if TSSP didn't assign or failed)
             if risk_bucket == "high":
                 action = "disengage"
-                task = None
+                task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
             elif deception >= dec_disengage or reliability < rel_disengage:
                 action = "disengage"
-                task = None
+                task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
             elif deception >= dec_flag:
                 action = "flag_for_ci"
                 task = rng.choice(TASK_ROSTER) if not tssp_assignments else (source_to_task.get(source_id) or rng.choice(TASK_ROSTER))
@@ -355,7 +383,7 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
         # Calculate expected risk (post-recourse, adjusted by action)
         expected_risk = intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
         expected_risk = float(np.clip(expected_risk, 0.0, 1.0))
-        score = reliability * (1 - deception) * (1 - expected_risk)
+        score = reliability * (1 - deception) * (1 - expected_risk) * 100  # Scale to 0-100
         
         policy_item = {
             "source_id": source_id,
@@ -366,49 +394,124 @@ def run_optimization(payload: Dict[str, Any], ml_pipeline=None) -> Dict[str, Any
             "expected_risk": float(expected_risk),
             "intrinsic_risk": float(intrinsic_risk),
             "risk_bucket": risk_bucket,
-            "score": float(score)
+            "score": float(score),
+            "behavior_probabilities": behavior_probs_ml
         }
         
         policies["ml_tssp"].append(policy_item)
 
-        # Deterministic: Stage 1 only, fixed moderate risk, no ML, no TSSP, no Stage 2
-        # Independent baseline model for comparison
-        det_item = policy_item.copy()
-        det_item["intrinsic_risk"] = 0.5  # Fixed moderate intrinsic risk for baseline
-        det_item["expected_risk"] = 0.5
-        det_item["risk_bucket"] = "medium"  # Fixed medium risk bucket
-        det_item["score"] = reliability * (1 - deception) * (1 - det_item["expected_risk"])
+        # ===== DETERMINISTIC BASELINE =====
+        # Independent baseline model: Stage 1 only, rule-based risk assessment
+        det_reliability = reliability_scores[f"{source_id}_deterministic"]
+        det_deception = deception_scores[f"{source_id}_deterministic"]
+
+        # Deterministic uses fixed moderate risk (no behavior modeling)
+        det_intrinsic_risk = 0.5
+        det_expected_risk = det_intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
+        det_expected_risk = float(np.clip(det_expected_risk, 0.0, 1.0))
+
+        # Deterministic makes its OWN decisions based on fixed risk
+        det_risk_bucket = "medium"  # Always medium due to fixed risk
+        if det_risk_bucket == "high" or det_deception >= dec_disengage or det_reliability < rel_disengage:
+            det_action = "disengage"
+            det_task = rng.choice(TASK_ROSTER)
+        elif det_deception >= dec_flag:
+            det_action = "flag_for_ci"
+            det_task = rng.choice(TASK_ROSTER)
+        elif det_reliability < rel_flag:
+            det_action = "flag_and_task"
+            det_task = rng.choice(TASK_ROSTER)
+        else:
+            det_action = "task"
+            det_task = rng.choice(TASK_ROSTER)
+
+        det_final_expected_risk = det_intrinsic_risk * ACTION_RISK_MULTIPLIER.get(det_action, 1.0)
+        det_final_expected_risk = float(np.clip(det_final_expected_risk, 0.0, 1.0))
+        det_score = det_reliability * (1 - det_deception) * (1 - det_final_expected_risk) * 100  # Scale to 0-100
+
+        det_item = {
+            "source_id": source_id,
+            "reliability": float(det_reliability),
+            "deception": float(det_deception),
+            "action": det_action,
+            "task": det_task,
+            "expected_risk": float(det_final_expected_risk),
+            "intrinsic_risk": float(det_intrinsic_risk),
+            "risk_bucket": det_risk_bucket,
+            "score": float(det_score)
+        }
         policies["deterministic"].append(det_item)
 
-        # Uniform: Stage 1 only, equal allocation, no ML, no TSSP, no Stage 2
-        # Independent baseline model for comparison - uses uniform distribution across behaviors
-        # Uniform risk = average of all behavior risks (equal probability assumption)
-        uniform_risk = sum(BEHAVIOR_RISK_MAP.values()) / len(BEHAVIOR_RISK_MAP)
-        uni_item = policy_item.copy()
-        uni_item["intrinsic_risk"] = float(uniform_risk)  # Use uniform risk as intrinsic
-        uni_item["expected_risk"] = float(uniform_risk)
-        # Determine risk bucket for uniform
-        if uniform_risk < 0.3:
+        # ===== UNIFORM BASELINE =====
+        # Independent baseline model: Stage 1 only, equal probability assumption
+        uni_reliability = reliability_scores[f"{source_id}_uniform"]
+        uni_deception = deception_scores[f"{source_id}_uniform"]
+        uni_behavior_probs = behavior_probs_dict[f"{source_id}_uniform"]
+
+        # Uniform calculates intrinsic risk from equal behavior probabilities
+        uni_intrinsic_risk = sum(
+            float(prob) * BEHAVIOR_RISK_MAP.get(behavior, 0.5)
+            for behavior, prob in uni_behavior_probs.items()
+        )
+        uni_intrinsic_risk = float(np.clip(uni_intrinsic_risk, 0.0, 1.0))
+        uni_expected_risk = uni_intrinsic_risk * ACTION_RISK_MULTIPLIER.get(action, 1.0)
+        uni_expected_risk = float(np.clip(uni_expected_risk, 0.0, 1.0))
+
+        # Uniform makes its OWN decisions based on its risk assessment
+        if uni_intrinsic_risk < low_threshold:
             uni_risk_bucket = "low"
-        elif uniform_risk > 0.6:
+        elif uni_intrinsic_risk > medium_threshold:
             uni_risk_bucket = "high"
         else:
             uni_risk_bucket = "medium"
-        uni_item["risk_bucket"] = uni_risk_bucket
-        uni_item["score"] = reliability * (1 - deception) * (1 - uni_item["expected_risk"])
+
+        if uni_risk_bucket == "high" or uni_deception >= dec_disengage or uni_reliability < rel_disengage:
+            uni_action = "disengage"
+            uni_task = rng.choice(TASK_ROSTER)
+        elif uni_deception >= dec_flag:
+            uni_action = "flag_for_ci"
+            uni_task = rng.choice(TASK_ROSTER)
+        elif uni_reliability < rel_flag:
+            uni_action = "flag_and_task"
+            uni_task = rng.choice(TASK_ROSTER)
+        else:
+            uni_action = "task"
+            uni_task = rng.choice(TASK_ROSTER)
+
+        uni_final_expected_risk = uni_intrinsic_risk * ACTION_RISK_MULTIPLIER.get(uni_action, 1.0)
+        uni_final_expected_risk = float(np.clip(uni_final_expected_risk, 0.0, 1.0))
+        uni_score = uni_reliability * (1 - uni_deception) * (1 - uni_final_expected_risk) * 100  # Scale to 0-100
+
+        uni_item = {
+            "source_id": source_id,
+            "reliability": float(uni_reliability),
+            "deception": float(uni_deception),
+            "action": uni_action,
+            "task": uni_task,
+            "expected_risk": float(uni_final_expected_risk),
+            "intrinsic_risk": float(uni_intrinsic_risk),
+            "risk_bucket": uni_risk_bucket,
+            "score": float(uni_score)
+        }
         policies["uniform"].append(uni_item)
     
-    # Calculate EMV
+    # Calculate EMV and improvement percentages
     ml_emv = sum(p["score"] for p in policies["ml_tssp"])
     det_emv = sum(p["score"] for p in policies["deterministic"])
     uni_emv = sum(p["score"] for p in policies["uniform"])
+
+    # Calculate improvement percentages over baselines
+    det_improvement = ((ml_emv - det_emv) / det_emv * 100) if det_emv > 0 else 0.0
+    uni_improvement = ((ml_emv - uni_emv) / uni_emv * 100) if uni_emv > 0 else 0.0
 
     return {
         "policies": policies,
         "emv": {
             "ml_tssp": ml_emv,
             "deterministic": det_emv,
-            "uniform": uni_emv
+            "uniform": uni_emv,
+            "improvement_over_deterministic": det_improvement,
+            "improvement_over_uniform": uni_improvement
         },
         "_using_ml_models": True,
         "_using_fallback": False
