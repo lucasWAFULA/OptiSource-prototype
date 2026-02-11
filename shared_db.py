@@ -790,5 +790,38 @@ def get_threshold_request_history(limit: int = 50) -> List[Dict]:
 # Set DB_ENGINE to "sqlite" for compatibility with dashboard.py
 DB_ENGINE = "sqlite"
 
+# Use PostgreSQL/Supabase when DATABASE_URL is set (shared results across regions)
+if os.environ.get("DATABASE_URL"):
+    try:
+        from shared_db_postgres import (
+            get_db_connection,
+            init_database,
+            log_audit,
+            save_source,
+            save_assignment,
+            batch_save_sources,
+            batch_save_assignments,
+            submit_tasking_request,
+            get_user_tasking_requests,
+            get_latest_assignments,
+            get_audit_log,
+            save_optimization_results,
+            load_latest_optimization_results,
+            get_optimization_results_timestamp,
+            clear_shared_db,
+            clear_optimization_results,
+            submit_threshold_request,
+            approve_threshold_request,
+            reject_threshold_request,
+            get_active_threshold_settings,
+            get_pending_threshold_requests,
+            get_threshold_request_history,
+            DB_ENGINE,
+            DB_CONNECTED,
+            DB_PATH,
+        )
+    except Exception:
+        pass  # Fall back to SQLite if Postgres import fails
+
 # Initialize database on import
 init_database()

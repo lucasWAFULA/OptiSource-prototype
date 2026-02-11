@@ -138,6 +138,9 @@ For more details, see the role and permission logic in `dashboard.py`.
    python main.py --n-sources 15000 --opt-sources 100 --opt-tasks 10 --solver glpk
    ```
 
+**Environment variables**
+- **`DATABASE_URL`** (optional): When set to a PostgreSQL connection URI (e.g. [Supabase](https://supabase.com)), the shared database (optimization results, assignments, audit) uses PostgreSQL instead of local SQLite. This allows **shared results across regions**—all instances that set the same `DATABASE_URL` read and write the same data. See **[docs/POSTGRES_SUPABASE_SETUP.md](docs/POSTGRES_SUPABASE_SETUP.md)** for setup steps.
+
 #### Outputs
 - `models/`: Trained ML models (`classification_model.pkl`, `reliability_model.keras`, `deception_model.keras`, scalers)
 - `output/`: Cost/risk plots, assignment tables, reports
@@ -198,6 +201,7 @@ cd Updated-FINAL-DASH
 ```bash
 pip install -r requirements.txt
 ```
+   - **Python version:** This project uses Keras GRU for deception and reliability prediction, which requires TensorFlow. Use **Python 3.10, 3.11, or 3.12** (TensorFlow does not support 3.13 yet).
 
 3. Install optimization solver (choose one):
    - **GLPK** (open-source): `sudo apt-get install glpk-utils` (Linux) or download from [GLPK website](https://www.gnu.org/software/glpk/)

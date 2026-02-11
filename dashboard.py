@@ -400,6 +400,7 @@ NAV_PERMISSION_MAP = {
     "policies": {"view_reports", "view_capabilities", "view_longitudinal_metrics", "view_aggregated_dashboards"},
     "evpi": {"view_reports", "view_longitudinal_metrics", "view_aggregated_dashboards", "view_capabilities", "execute_optimization"},
     "stress": {"view_reports", "view_longitudinal_metrics", "view_capabilities", "execute_optimization"},
+    "chat": {"view_reports", "view_capabilities", "view_longitudinal_metrics", "view_aggregated_dashboards"},
     "admin": {"manage_users", "configure_system"},
 }
 # Note: Analysts with execute_optimization permission can access profiles
@@ -420,6 +421,135 @@ def has_permission(permission: str) -> bool:
 def _can_access_nav(nav_key: str) -> bool:
     required = NAV_PERMISSION_MAP.get(nav_key, set())
     return any(has_permission(p) for p in required) if required else False
+
+def _set_nav(nav_key: str) -> None:
+    """Set current navigation section (e.g. 'profiles', 'policies', 'evpi', 'stress', 'chat', 'admin')."""
+    if nav_key in NAV_PERMISSION_MAP and _can_access_nav(nav_key):
+        st.session_state["nav_pills"] = nav_key
+
+# ---------- Chat: AI-assisted interpretability layer (read-only; does not change model or decisions) ----------
+CHAT_SYSTEM_PROMPT = """You are an analytical assistant for an ML-driven two-stage stochastic decision-support system.
+
+Rules:
+- Explain model outputs clearly.
+- Do not recommend actions.
+- Do not modify decisions.
+- Highlight uncertainty.
+- Encourage human judgment.
+
+Answer only from the context provided. If the question is outside the allowed scope, say so briefly."""
+
+ALLOWED_CHAT_INTENTS = ("explanation", "risk_clarification", "scenario_interpretation", "system_confidence")
+
+def _build_chat_context(source_id=None):
+    """Build structured context for chat from current ML-TSSP outputs (read-only)."""
+    results = st.session_state.get("results")
+    if not results or not results.get("policies") or not results.get("policies", {}).get("ml_tssp"):
+        return None
+    ml_policy = results["policies"]["ml_tssp"]
+    by_id = {p.get("source_id"): p for p in ml_policy if p.get("source_id")}
+    if source_id and source_id in by_id:
+        p = by_id[source_id]
+        return {
+            "source_id": source_id,
+            "reliability": p.get("reliability"),
+            "deception_risk": p.get("deception") or p.get("deception_score"),
+            "behaviour_class": p.get("risk_bucket") or "—",
+            "tssp_decision": p.get("task") or p.get("action") or "—",
+            "expected_risk": p.get("expected_risk"),
+            "score": p.get("score"),
+        }
+    # Summary across all sources (no single source_id)
+    summary = {
+        "n_sources": len(ml_policy),
+        "emv_ml_tssp": results.get("emv", {}).get("ml_tssp"),
+        "sample_sources": [p.get("source_id") for p in ml_policy[:5]],
+    }
+    return summary
+
+def _classify_chat_intent(question: str) -> str:
+    """Classify user question into allowed intent or 'rejected'."""
+    q = (question or "").strip().lower()
+    if not q:
+        return "rejected"
+    if any(w in q for w in ("why", "explain", "how come", "reason", "classified", "behavior", "behaviour")):
+        return "explanation"
+    if any(w in q for w in ("deception", "coercion", "coerced", "risk", "clarif", "difference")):
+        return "risk_clarification"
+    if any(w in q for w in ("if ", "withdraw", "scenario", "happen", "sensitivity", "what if")):
+        return "scenario_interpretation"
+    if any(w in q for w in ("confident", "confidence", "model today", "uncertainty", "trust")):
+        return "system_confidence"
+    return "rejected"
+
+def _chat_call_llm(system_prompt: str, user_message: str, context_str: str) -> str:
+    """Call LLM with fixed system prompt and context. Returns reply or error message."""
+    try:
+        import openai
+    except ImportError:
+        return "Chat requires the `openai` package. Install with: pip install openai. Set OPENAI_API_KEY in your environment."
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY_OPTISOURCE")
+    if not api_key:
+        return "Chat is not configured. Set OPENAI_API_KEY (or OPENAI_API_KEY_OPTISOURCE) in your environment to enable the interpretability assistant."
+    full_system = system_prompt + "\n\nContext:\n" + (context_str or "No results loaded. Run optimization first.")
+    try:
+        client = openai.OpenAI(api_key=api_key)
+        r = client.chat.completions.create(
+            model=os.environ.get("CHAT_MODEL", "gpt-4o-mini"),
+            messages=[
+                {"role": "system", "content": full_system},
+                {"role": "user", "content": user_message},
+            ],
+            max_tokens=500,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"Unable to get a response: {str(e)}"
+
+def _render_chat_section():
+    """Render the read-only chat interface for ML-TSSP interpretability."""
+    st.markdown("""<h3 class="section-header">💬 Interpretability Assistant</h3>
+    <p style="text-align:center;color:#6b7280;font-size:13px;margin:0 0 1rem 0;">
+        Ask questions about <strong>explanations</strong>, <strong>risk clarification</strong>, <strong>scenario interpretation</strong>, or <strong>system confidence</strong>. 
+        The assistant explains model outputs only; it does not change decisions or recommend actions.
+    </p>""", unsafe_allow_html=True)
+    results = st.session_state.get("results")
+    ml_policy = (results or {}).get("policies", {}).get("ml_tssp", [])
+    source_ids = [p.get("source_id") for p in ml_policy if p.get("source_id")]
+    default_context = _build_chat_context()
+    source_for_context = None
+    if source_ids:
+        source_for_context = st.selectbox(
+            "Optional: focus context on a source (for explanation / risk questions)",
+            ["— All results (summary)"] + source_ids,
+            key="chat_source_selector",
+        )
+        if source_for_context and source_for_context != "— All results (summary)":
+            default_context = _build_chat_context(source_for_context)
+    if default_context is None and not source_ids:
+        st.info("Run an optimization from **Source Profiles** to load results. The assistant will then explain those outputs.")
+        return
+    context_str = json.dumps(default_context, indent=2) if default_context else "No results."
+    if "chat_messages" not in st.session_state:
+        st.session_state["chat_messages"] = []
+    for msg in st.session_state["chat_messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+    prompt = st.chat_input("Ask about model outputs (e.g. why a source is classified, risk clarification, scenarios)")
+    if prompt:
+        intent = _classify_chat_intent(prompt)
+        if intent == "rejected":
+            st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+            st.session_state["chat_messages"].append({
+                "role": "assistant",
+                "content": "I can only answer questions about: (1) Explaining classifications, (2) Risk/deception vs coercion clarification, (3) Scenario interpretation (e.g. what if a source withdraws), (4) System confidence. Please rephrase or ask within these topics.",
+            })
+            st.rerun()
+        full_system = CHAT_SYSTEM_PROMPT
+        reply = _chat_call_llm(full_system, prompt, context_str)
+        st.session_state["chat_messages"].append({"role": "user", "content": prompt})
+        st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
+        st.rerun()
 
 def _pseudonymize_source_id(source_id: str, username: str) -> str:
     raw = f"{username}:{source_id}".encode("utf-8")
@@ -1663,7 +1793,7 @@ def _check_system_health():
     if SHARED_DB_AVAILABLE:
         health['details']['shared_db_engine'] = DB_ENGINE
         health['details']['shared_db_connected'] = DB_CONNECTED
-        health['details']['shared_db_mode'] = "Local (SQLite)"
+        health['details']['shared_db_mode'] = "PostgreSQL/Supabase" if DB_ENGINE == "postgres" else "Local (SQLite)"
     else:
         health['details']['shared_db_engine'] = "Not Available"
         health['details']['shared_db_connected'] = False
@@ -2525,6 +2655,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
         
         if ml_policy:
             display_df = pd.DataFrame(ml_policy)
+            display_df = _apply_behavior_probabilities_display(display_df)
             if 'behavior_probs' in display_df.columns:
                 display_df = display_df.drop(columns=['behavior_probs'], errors='ignore')
             if 'behavior_costs' in display_df.columns:
@@ -2578,6 +2709,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             
             if det_policy:
                 display_df = pd.DataFrame(det_policy)
+                display_df = _apply_behavior_probabilities_display(display_df)
                 if 'behavior_probs' in display_df.columns:
                     display_df = display_df.drop(columns=['behavior_probs'], errors='ignore')
                 if 'behavior_costs' in display_df.columns:
@@ -2631,6 +2763,7 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
             
             if uni_policy:
                 display_df = pd.DataFrame(uni_policy)
+                display_df = _apply_behavior_probabilities_display(display_df)
                 if 'behavior_probs' in display_df.columns:
                     display_df = display_df.drop(columns=['behavior_probs'], errors='ignore')
                 if 'behavior_costs' in display_df.columns:
@@ -2665,11 +2798,47 @@ def _render_comparative_policy_section(results, ml_policy, det_policy, uni_polic
     
     # (Removed duplicate/empty sub-expander blocks)
 
+
+def _format_behavior_probabilities_for_display(val):
+    """Format behavior_probabilities dict as a compact readable string for table display."""
+    if val is None or (isinstance(val, float) and np.isnan(val)):
+        return ""
+    if isinstance(val, str):
+        try:
+            val = json.loads(val)
+        except Exception:
+            return val[:80] + "…" if len(val) > 80 else val
+    if not isinstance(val, dict):
+        return str(val)[:80] + ("…" if len(str(val)) > 80 else "")
+    short = {"cooperative": "Coop", "coerced": "Coerced", "uncertain": "Uncert", "deceptive": "Dec"}
+    parts = []
+    for k, v in sorted(val.items()):
+        try:
+            pct = round(float(v) * 100, 1)
+            label = short.get((k or "").lower(), (k or "")[:6].capitalize())
+            parts.append(f"{label}: {pct}%")
+        except (TypeError, ValueError):
+            parts.append(f"{k}: {v}")
+    return "  ".join(parts) if parts else ""
+
+
+def _apply_behavior_probabilities_display(df):
+    """If DataFrame has behavior_probabilities column, replace with formatted strings for display."""
+    if df is None or df.empty:
+        return df
+    if "behavior_probabilities" not in df.columns:
+        return df
+    df = df.copy()
+    df["behavior_probabilities"] = df["behavior_probabilities"].map(_format_behavior_probabilities_for_display)
+    return df
+
+
 def _render_optimal_policy_section(results):
     st.markdown('<div class="insight-box">Recommended ML–TSSP assignment details.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get("ml_tssp", [])
     if policy:
         df = pd.DataFrame(policy)
+        df = _apply_behavior_probabilities_display(df)
         # Show all sources, including eliminated
         st.dataframe(df, use_container_width=True)
         # Risk breakdown pie: include eliminated
@@ -2714,7 +2883,9 @@ def _render_baseline_policy_section(title, policy_key, results):
     st.markdown(f'<div class="insight-box">{title} breakdown.</div>', unsafe_allow_html=True)
     policy = results.get("policies", {}).get(policy_key, [])
     if policy:
-        st.dataframe(pd.DataFrame(policy))
+        df = pd.DataFrame(policy)
+        df = _apply_behavior_probabilities_display(df)
+        st.dataframe(df)
         _ensure_source_state_and_risk_bucket(policy)
         risk_levels = pd.Series([
             "Low" if _get_risk_bucket_from_assignment(a) == "low"
@@ -6933,6 +7104,7 @@ def render_streamlit_app():
         "📈 Policy Insights",
         "💰 EVPI Focus",
         "🔬 Stress Lab",
+        "💬 Interpretability Chat",
         "⚙️ System Administration"
     ]
     nav_lookup = {
@@ -6940,6 +7112,7 @@ def render_streamlit_app():
         "📈 Policy Insights": "policies",
         "💰 EVPI Focus": "evpi",
         "🔬 Stress Lab": "stress",
+        "💬 Interpretability Chat": "chat",
         "⚙️ System Administration": "admin"
     }
     nav_labels = [label for label in nav_labels if _can_access_nav(nav_lookup.get(label, ""))]
@@ -7611,7 +7784,14 @@ def render_streamlit_app():
                             st.error("Please upload a source data file first.")
                             st.stop()
                         df = st.session_state["sources_df"]
-                        assert df["source_id"].is_unique, "source_id must be unique per source"
+                        if not df["source_id"].is_unique:
+                            dupes = df[df["source_id"].duplicated(keep=False)]["source_id"].unique().tolist()
+                            st.error(
+                                "**Invalid data: duplicate source IDs.** Each source must have a unique `source_id`. "
+                                f"Duplicate value(s) found: {dupes[:10]}{'...' if len(dupes) > 10 else ''}. "
+                                "Please fix or remove duplicates in your file and upload again."
+                            )
+                            st.stop()
                         # Build sources from DataFrame
                         sources = []
                         current_rules = st.session_state.get("recourse_rules") or {
@@ -8311,6 +8491,11 @@ def render_streamlit_app():
         
         with st.expander("🔬 Behavioral Uncertainty & Stress Analysis (What-If)", expanded=True):
             _render_stress_section(ml_policy, ml_emv, det_emv, uni_emv, risk_reduction)
+        st.markdown('</div>', unsafe_allow_html=True)
+    
+    elif nav_key == "chat":
+        st.markdown('<div class="section-frame">', unsafe_allow_html=True)
+        _render_chat_section()
         st.markdown('</div>', unsafe_allow_html=True)
     
     elif nav_key == "admin":

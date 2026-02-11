@@ -43,6 +43,11 @@ coverage.xml
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Virtual environments
+.venv/
+venv/
+env/
+
 # pyenv
 .python-version
 

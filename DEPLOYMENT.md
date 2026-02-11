@@ -16,6 +16,10 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
+## Environment variables
+
+- **`DATABASE_URL`** (optional): Set to a PostgreSQL connection URI (e.g. Supabase) to use a shared database instead of local SQLite. All deployments using the same `DATABASE_URL` share optimization results and assignments across regions. See **[docs/POSTGRES_SUPABASE_SETUP.md](docs/POSTGRES_SUPABASE_SETUP.md)** for full setup (Supabase project, schema, and connection string).
+
 ## Repository Structure
 - `dashboard.py`: Main Streamlit dashboard logic
 - `streamlit_app.py`: Entry point for Streamlit Cloud
